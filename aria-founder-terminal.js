@@ -212,7 +212,7 @@ GET SINGLE ITEM:
 query { items(ids: [ITEM_ID]) { id name column_values { id text value } updates(limit: 5) { body created_at } created_at } }
 
 GET BOARD ANALYTICS:
-query { boards(ids: [${BOARD_ID}]) { items_count groups { id title items_count } } }
+query { boards(ids: [${BOARD_ID}]) { items_count groups { id title } } }
 
 GET RECENT ITEMS (last 10):
 query { boards(ids: [${BOARD_ID}]) { items_page(limit: 10, query_params: {order_by: [{column_id: "creation_log__1", direction: desc}]}) { items { id name column_values { id text } created_at } } } }
@@ -258,7 +258,7 @@ CREATE NEW GROUP:
 mutation { create_group(board_id: ${BOARD_ID}, group_name: "GROUP_NAME") { id } }
 
 GET ALL GROUPS:
-query { boards(ids: [${BOARD_ID}]) { groups { id title items_count } } }
+query { boards(ids: [${BOARD_ID}]) { groups { id title } } }
 
 ═══════════════════════════════════════════════════════════════
 WHAT SOURABH CAN ASK YOU
