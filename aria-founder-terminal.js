@@ -40,7 +40,6 @@ const path    = require('path');
 const express = require('express');
 const axios   = require('axios');
 const helmet  = require('helmet');
-const rateLimit = require('express-rate-limit');
 
 const logger              = require('./lib/logger');
 const { sanitizeQueries } = require('./lib/sanitize');
@@ -53,13 +52,8 @@ app.set('trust proxy', 1);
 app.use(express.json());
 app.use(helmet());
 
-// General API rate limit (60 req/min per IP)
-app.use(rateLimit({
-  windowMs: 60000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-}));
+// Rate limiting disabled temporarily for Railway deployment
+// TODO: Re-enable after deployment is stable
 
 // ============================================================
 // DATA DIRECTORY
