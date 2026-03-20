@@ -646,13 +646,7 @@ async function processFounderMessage(chatId, messageText) {
 // TELEGRAM WEBHOOK
 // ============================================================
 
-app.post(`/telegram/:token`, async (req, res) => {
-  // Validate the token matches our bot
-  if (req.params.token !== CONFIG.telegram.botToken) {
-    res.sendStatus(404);
-    return;
-  }
-
+app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
   res.sendStatus(200); // Always acknowledge immediately
 
   try {
