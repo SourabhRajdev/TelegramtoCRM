@@ -1,0 +1,9 @@
+node_modules
+data
+.env
+.git
+.vscode
+*.md
+test
+coverage
+.github
