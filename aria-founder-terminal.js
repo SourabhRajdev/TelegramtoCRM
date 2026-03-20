@@ -46,6 +46,29 @@ const { sanitizeQueries } = require('./lib/sanitize');
 const Cache               = require('./lib/cache');
 const { logAudit }        = require('./lib/audit');
 
+// V2 Multi-tenant imports
+let db, oauth, userContext, boardSelector, admin, ai, telegram;
+let isV2Mode = false;
+
+// Initialize V2 modules if OAuth is configured
+try {
+  if (process.env.MONDAY_CLIENT_ID && process.env.ENCRYPTION_KEY) {
+    db = require('./lib/database');
+    oauth = require('./lib/oauth');
+    userContext = require('./lib/userContext');
+    boardSelector = require('./lib/boardSelector');
+    admin = require('./lib/admin');
+    ai = require('./lib/ai');
+    telegram = require('./lib/telegram');
+    isV2Mode = true;
+    console.log('[ARIA] V2 Multi-tenant mode enabled');
+  } else {
+    console.log('[ARIA] V1 Single-tenant mode (missing OAuth config)');
+  }
+} catch (error) {
+  console.warn('[ARIA] V2 modules not available, running in V1 mode:', error.message);
+}
+
 const app = express();
 // Trust proxy for Railway/Cloudflare reverse proxy
 app.set('trust proxy', 1);
@@ -54,6 +77,93 @@ app.use(helmet());
 
 // Rate limiting disabled temporarily for Railway deployment
 // TODO: Re-enable after deployment is stable
+
+// ============================================================
+// V2 OAUTH ROUTES (Multi-tenant)
+// ============================================================
+
+if (isV2Mode) {
+  // OAuth start - redirect user to Monday.com
+  app.get('/auth/monday/start/:telegramUserId', (req, res) => {
+    try {
+      const telegramUserId = req.params.telegramUserId;
+      const authUrl = oauth.getAuthorizationUrl(telegramUserId);
+      res.redirect(authUrl);
+    } catch (error) {
+      console.error('[OAuth] Start failed:', error.message);
+      res.status(500).send('OAuth initialization failed');
+    }
+  });
+
+  // OAuth callback - handle Monday.com response
+  app.get('/auth/monday/callback', async (req, res) => {
+    try {
+      const { code, state, error } = req.query;
+      
+      if (error) {
+        res.send(`
+          <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+            <h2>❌ Authorization Cancelled</h2>
+            <p>You cancelled the Monday.com connection.</p>
+            <p>Go back to Telegram and send /start to try again.</p>
+          </body></html>
+        `);
+        return;
+      }
+      
+      if (!code || !state) {
+        res.status(400).send('Missing authorization code or state');
+        return;
+      }
+      
+      const result = await oauth.handleCallback(code, state);
+      
+      if (result.success) {
+        // Notify user via Telegram
+        await telegram.sendTelegramMessage(result.telegram_user_id,
+          `✅ **Connected Successfully!**\n\n` +
+          `Welcome, ${result.monday_user_name} from ${result.company_name}.\n\n` +
+          `Let me find your boards...`
+        );
+        
+        // Trigger board selection
+        await boardSelector.presentBoardSelection(result.telegram_user_id);
+        
+        res.send(`
+          <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+            <h2>✅ Connection Successful!</h2>
+            <p>Welcome, ${result.monday_user_name}!</p>
+            <p>Go back to Telegram to complete your setup.</p>
+            <script>setTimeout(() => window.close(), 3000);</script>
+          </body></html>
+        `);
+      } else {
+        res.send(`
+          <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+            <h2>❌ Connection Failed</h2>
+            <p>Error: ${result.error}</p>
+            <p>Go back to Telegram and send /start to try again.</p>
+          </body></html>
+        `);
+      }
+    } catch (error) {
+      console.error('[OAuth] Callback failed:', error.message);
+      res.status(500).send('OAuth processing failed');
+    }
+  });
+
+  // Success page
+  app.get('/auth/success', (req, res) => {
+    res.send(`
+      <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+        <h2>✅ ARIA Connected!</h2>
+        <p>Your Monday.com account is now connected.</p>
+        <p>Return to Telegram to start using ARIA.</p>
+        <script>setTimeout(() => window.close(), 3000);</script>
+      </body></html>
+    `);
+  });
+}
 
 // ============================================================
 // DATA DIRECTORY
@@ -479,6 +589,12 @@ function formatMondayResults(results) {
 // ============================================================
 
 async function sendTelegramMessage(chatId, text) {
+  // Use V2 telegram module if available
+  if (isV2Mode && telegram) {
+    return await telegram.sendTelegramMessage(chatId, text);
+  }
+  
+  // V1 fallback
   // Split long messages — Telegram has 4096 char limit
   const chunks = [];
   let remaining = text;
@@ -513,6 +629,12 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 async function sendTypingIndicator(chatId) {
+  // Use V2 telegram module if available
+  if (isV2Mode && telegram) {
+    return await telegram.sendTypingIndicator(chatId);
+  }
+  
+  // V1 fallback
   try {
     await axios.post(
       `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendChatAction`,
@@ -527,6 +649,353 @@ async function sendTypingIndicator(chatId) {
 // CORE MESSAGE PROCESSOR
 // The main brain loop
 // ============================================================
+
+// ============================================================
+// V2 MESSAGE PROCESSING (Multi-tenant with V1 fallback)
+// ============================================================
+
+async function processMessage(chatId, messageText) {
+  if (isV2Mode) {
+    return await processV2Message(chatId, messageText);
+  } else {
+    return await processFounderMessage(chatId, messageText);
+  }
+}
+
+async function processV2Message(chatId, messageText) {
+  logger.info('V2 message received', { chatId, message: messageText });
+
+  try {
+    // Load user context
+    const context = await userContext.loadContext(chatId.toString());
+    
+    // Handle different user states
+    if (context.error === 'not_registered') {
+      return await handleNewUser(chatId, messageText);
+    }
+    
+    if (context.error === 'oauth_pending') {
+      return await sendAuthLink(chatId);
+    }
+    
+    if (context.error === 'board_select') {
+      return await handleBoardSelection(chatId, messageText);
+    }
+    
+    if (context.error === 'deactivated') {
+      await telegram.sendTelegramMessage(chatId, 
+        "⚠️ Your ARIA access has been deactivated.\n\n" +
+        "Please contact your administrator for assistance."
+      );
+      return;
+    }
+    
+    if (context.error === 'decrypt_failed') {
+      await telegram.sendTelegramMessage(chatId,
+        "🔐 Your connection needs to be refreshed.\n\n" +
+        "Click here to reconnect: /start"
+      );
+      return;
+    }
+    
+    // Handle admin commands
+    if (messageText.startsWith('/') && admin.isAdmin(chatId.toString())) {
+      return await admin.routeAdminCommand(chatId.toString(), messageText);
+    }
+    
+    // Handle regular commands
+    if (messageText.startsWith('/')) {
+      return await handleV2Commands(chatId, messageText, context);
+    }
+    
+    // Per-chat rate limit
+    if (!checkChatRateLimit(chatId)) {
+      logger.warn('Chat rate limit exceeded', { chatId });
+      await telegram.sendTelegramMessage(chatId, 'Rate limit exceeded. Wait a moment.');
+      return;
+    }
+    
+    // Show typing indicator
+    await sendTypingIndicator(chatId);
+    
+    // Resolve which board this query targets
+    const boardContext = await userContext.resolveBoard(context, messageText);
+    
+    if (boardContext.needsSelection) {
+      return await sendBoardPicker(chatId, boardContext.boards);
+    }
+    
+    if (boardContext.error) {
+      await telegram.sendTelegramMessage(chatId, boardContext.message);
+      return;
+    }
+    
+    // Process with AI using user context
+    const aiResult = await ai.processWithAI(messageText, conversationHistory, {
+      userName: context.user.telegram_first_name,
+      companyName: context.user.company_name,
+      boardId: boardContext.board_id,
+      boardName: boardContext.board_name,
+      accessLevel: context.user.access_level,
+      availableBoards: context.boards,
+      isFounder: context.isFounder
+    });
+    
+    logger.info('AI operation determined', { operation: aiResult.operation_type });
+    
+    // Execute Monday.com queries if needed
+    if (aiResult.requires_monday_action && aiResult.graphql_queries?.length > 0) {
+      const isRead = ['read', 'analytics', 'intelligence'].includes(aiResult.operation_type);
+      const cacheKey = isRead ? JSON.stringify(aiResult.graphql_queries) : null;
+      let mondayResults;
+      
+      const cachedResult = cacheKey ? queryCache.get(cacheKey) : null;
+      if (cachedResult) {
+        logger.info('Cache hit for read query');
+        mondayResults = cachedResult;
+      } else {
+        // Execute with user's own token
+        mondayResults = [];
+        for (const query of aiResult.graphql_queries) {
+          const result = await userContext.executeWithUserToken(chatId.toString(), query);
+          mondayResults.push(result);
+        }
+        if (cacheKey) queryCache.set(cacheKey, mondayResults);
+      }
+      
+      const mondayContext = formatMondayResults(mondayResults);
+      
+      // For read operations, format response with AI
+      if (isRead) {
+        const refinedResult = await ai.processWithAI(
+          `The Monday.com data has been retrieved. Format it clearly for the user.`,
+          conversationHistory,
+          {
+            userName: context.user.telegram_first_name,
+            companyName: context.user.company_name,
+            boardName: boardContext.board_name
+          }
+        );
+        await telegram.sendTelegramMessage(chatId, refinedResult.human_response);
+        return;
+      }
+      
+      // Handle followup actions
+      if (aiResult.followup_action && aiResult.followup_action.trim() !== '') {
+        const followupResult = await ai.processWithAI(
+          aiResult.followup_action,
+          conversationHistory,
+          {
+            userName: context.user.telegram_first_name,
+            companyName: context.user.company_name,
+            boardName: boardContext.board_name
+          }
+        );
+        
+        if (followupResult.requires_monday_action && followupResult.graphql_queries?.length > 0) {
+          for (const query of followupResult.graphql_queries) {
+            await userContext.executeWithUserToken(chatId.toString(), query);
+          }
+        }
+        
+        await telegram.sendTelegramMessage(chatId, followupResult.human_response);
+        queryCache.clear();
+        return;
+      }
+      
+      // Clear cache on write operations
+      if (['create', 'update', 'delete'].includes(aiResult.operation_type)) {
+        queryCache.clear();
+      }
+    }
+    
+    // Send AI response
+    await telegram.sendTelegramMessage(chatId, aiResult.human_response);
+    
+  } catch (error) {
+    logger.error('V2 message processing failed', { error: error.message, chatId });
+    await telegram.sendTelegramMessage(chatId, 
+      "😓 I encountered an error processing your request. Please try again in a moment."
+    );
+  }
+}
+
+// V2 Helper functions
+async function handleNewUser(chatId, messageText) {
+  // Create user record
+  const user = db.createUser({
+    telegram_user_id: chatId.toString(),
+    telegram_username: null, // Will be updated from message if available
+    telegram_first_name: null
+  });
+  
+  // Send welcome message with OAuth link
+  const authUrl = `${process.env.BASE_URL}/auth/monday/start/${chatId}`;
+  
+  await telegram.sendTelegramMessage(chatId,
+    "👋 **Welcome to ARIA** — your AI-powered CRM assistant!\n\n" +
+    "I help managers interact with their Monday.com boards using natural language right here in Telegram.\n\n" +
+    "To get started, I need to connect your Monday.com account. This is a one-time setup that takes about 30 seconds.\n\n" +
+    `👆 [Connect Monday.com](${authUrl})\n\n` +
+    "Your data stays private — I only access boards you authorize."
+  );
+  
+  db.setOnboardingState(chatId.toString(), 'oauth_pending');
+  
+  db.logAction({
+    telegram_user_id: chatId.toString(),
+    action: 'user_registered',
+    result_summary: 'New user started onboarding',
+    success: 1
+  });
+}
+
+async function sendAuthLink(chatId) {
+  const authUrl = `${process.env.BASE_URL}/auth/monday/start/${chatId}`;
+  
+  await telegram.sendTelegramMessage(chatId,
+    "🔗 **Connect Your Monday.com Account**\n\n" +
+    `👆 [Click here to connect](${authUrl})\n\n` +
+    "This will open Monday.com where you can authorize ARIA to access your boards."
+  );
+}
+
+async function handleBoardSelection(chatId, messageText) {
+  // Check if this is a board selection response
+  if (/^[\d,\s]+$/.test(messageText.trim()) || 
+      messageText.toLowerCase().trim() === 'all' ||
+      messageText.includes(',')) {
+    
+    const result = await boardSelector.processSelection(chatId.toString(), messageText);
+    
+    if (result.success) {
+      const boardNames = result.boards.map(b => b.board_name).join(', ');
+      await telegram.sendTelegramMessage(chatId,
+        `🎉 **You're all set!** Activated boards:\n\n` +
+        result.boards.map((b, i) => 
+          `${i === 0 ? '✅' : '•'} ${b.board_name}${i === 0 ? ' (default)' : ''}`
+        ).join('\n') +
+        `\n\n💡 **Try these commands:**\n` +
+        `• "show leads" — View items in your default board\n` +
+        `• "create lead John Doe" — Add a new item\n` +
+        `• "search Acme Corp" — Search across all boards\n` +
+        `• "board 2: show tasks" — Query a specific board\n` +
+        `• /boards — Manage board access\n` +
+        `• /status — Check your connection\n\n` +
+        `Ask me anything about your CRM! 💬`
+      );
+    } else {
+      await telegram.sendTelegramMessage(chatId, 
+        `❌ ${result.error}\n\nPlease try again or use /boards to see your available boards.`
+      );
+    }
+  } else {
+    // Show board selection again
+    await boardSelector.presentBoardSelection(chatId.toString());
+  }
+}
+
+async function handleV2Commands(chatId, messageText, context) {
+  const command = messageText.toLowerCase().trim();
+  
+  switch (command) {
+    case '/start':
+      await telegram.sendTelegramMessage(chatId,
+        `👋 **Welcome back, ${context.user.telegram_first_name || 'there'}!**\n\n` +
+        `🏢 Company: ${context.user.company_name}\n` +
+        `📋 Connected boards: ${context.boards.length}\n` +
+        `🎯 Default board: ${context.defaultBoard?.board_name || 'None set'}\n\n` +
+        `💡 **Quick commands:**\n` +
+        `• "show leads" — View your CRM data\n` +
+        `• "create lead [name]" — Add new items\n` +
+        `• /boards — Manage board access\n` +
+        `• /status — Connection status\n` +
+        `• /help — Full command list`
+      );
+      break;
+      
+    case '/boards':
+      await boardSelector.presentBoardSelection(chatId.toString());
+      break;
+      
+    case '/status':
+      const verification = await oauth.verifyToken(chatId.toString());
+      await telegram.sendTelegramMessage(chatId,
+        `📊 **ARIA Connection Status**\n\n` +
+        `👤 User: ${context.user.telegram_first_name || 'Unknown'}\n` +
+        `🏢 Company: ${context.user.company_name || 'Unknown'}\n` +
+        `🔗 Monday.com: ${verification.valid ? '✅ Connected' : '❌ Disconnected'}\n` +
+        `📋 Active boards: ${context.boards.length}\n` +
+        `🎯 Default board: ${context.defaultBoard?.board_name || 'None'}\n` +
+        `📅 Last active: ${context.user.last_active_at ? new Date(context.user.last_active_at).toLocaleDateString() : 'Now'}\n\n` +
+        `${verification.valid ? '✅ All systems operational' : '⚠️ Reconnection needed - use /disconnect then /start'}`
+      );
+      break;
+      
+    case '/disconnect':
+      oauth.revokeToken(chatId.toString());
+      await telegram.sendTelegramMessage(chatId,
+        `🔌 **Disconnected from Monday.com**\n\n` +
+        `Your connection has been removed for security.\n\n` +
+        `To reconnect, send /start`
+      );
+      break;
+      
+    case '/help':
+      await telegram.sendTelegramMessage(chatId,
+        `📚 **ARIA Command Reference**\n\n` +
+        `**📊 Reports:**\n` +
+        `• show leads / show items\n` +
+        `• show new inquiries\n` +
+        `• show qualified leads\n` +
+        `• give me a full report\n` +
+        `• what happened today\n\n` +
+        `**✏️ Actions:**\n` +
+        `• create lead [name]\n` +
+        `• qualify [name]\n` +
+        `• update [name] status [value]\n` +
+        `• add note to [name]: [text]\n` +
+        `• delete [name]\n\n` +
+        `**🔍 Search:**\n` +
+        `• search [term]\n` +
+        `• find [name]\n` +
+        `• find phone [number]\n\n` +
+        `**⚙️ System:**\n` +
+        `• /boards — Manage board access\n` +
+        `• /status — Connection status\n` +
+        `• /disconnect — Remove connection\n` +
+        `• /clear — Reset conversation\n\n` +
+        `**💡 Multi-board:**\n` +
+        `• "board 2: show leads"\n` +
+        `• "board:sales show items"\n` +
+        `• Use board names in your queries`
+      );
+      break;
+      
+    case '/clear':
+      conversationHistory.length = 0;
+      saveConversation(conversationHistory);
+      queryCache.clear();
+      await telegram.sendTelegramMessage(chatId, '🧹 Conversation history cleared.');
+      break;
+      
+    default:
+      await telegram.sendTelegramMessage(chatId, 
+        `❓ Unknown command: ${command}\n\nUse /help to see all available commands.`
+      );
+  }
+}
+
+async function sendBoardPicker(chatId, boards) {
+  let message = `📋 **Which board?**\n\n`;
+  boards.forEach((board, index) => {
+    const emoji = board.is_default ? '🎯' : '📋';
+    message += `${board.index}. ${emoji} ${board.board_name} (${board.item_count} items)\n`;
+  });
+  message += `\nReply with a number (e.g., "2") or board name.`;
+  
+  await telegram.sendTelegramMessage(chatId, message);
+}
 
 async function processFounderMessage(chatId, messageText) {
   logger.info('Founder message received', { message: messageText });
@@ -684,7 +1153,7 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
     }
 
     // Process all other messages
-    await processFounderMessage(chatId, text);
+    await processMessage(chatId, text);
 
   } catch (err) {
     logger.error('Telegram webhook error', { error: err.message, stack: err.stack });
@@ -746,8 +1215,101 @@ app.listen(PORT, async () => {
   logger.info('  Entertainment — Dubai');
   logger.info(`  Port: ${PORT}`);
   logger.info('════════════════════════════════════════════════');
+  
+  // Initialize V2 database if in V2 mode
+  if (isV2Mode) {
+    try {
+      await db.initialize();
+      logger.info('✅ Database initialized');
+      
+      // Auto-migrate founder to V2 if needed
+      await autoMigrateFounder();
+    } catch (error) {
+      logger.error('❌ Database initialization failed:', error.message);
+      process.exit(1);
+    }
+  }
+  
   await registerTelegramWebhook();
-  logger.info('Ready. Sourabh can now command via Telegram.');
+  logger.info(`Ready. ${isV2Mode ? 'Multi-tenant' : 'Single-tenant'} mode active.`);
+});
+
+// ============================================================
+// V2 AUTO-MIGRATION & SHUTDOWN
+// ============================================================
+
+async function autoMigrateFounder() {
+  const founderChatId = process.env.TELEGRAM_FOUNDER_CHAT_ID;
+  if (!founderChatId) return;
+  
+  // Check if founder already exists in V2
+  const existingUser = db.getUser(founderChatId);
+  if (existingUser) return;
+  
+  logger.info('Auto-migrating founder to V2...');
+  
+  try {
+    // Create founder user
+    const user = db.createUser({
+      telegram_user_id: founderChatId,
+      telegram_username: 'founder',
+      telegram_first_name: 'Sourabh'
+    });
+    
+    // Set as admin
+    db.updateUser(founderChatId, {
+      access_level: 'admin',
+      onboarding_state: 'active',
+      company_name: 'Denicx Entertainment'
+    });
+    
+    // Migrate V1 token if available
+    if (process.env.MONDAY_API_TOKEN && process.env.MONDAY_INQUIRIES_BOARD_ID) {
+      const { encrypt } = require('./lib/encryption');
+      const encryptedToken = encrypt(process.env.MONDAY_API_TOKEN);
+      
+      db.storeMondayToken(founderChatId, {
+        encrypted: encryptedToken.encrypted,
+        iv: encryptedToken.iv,
+        tag: encryptedToken.tag,
+        monday_user_id: 'migrated_v1',
+        monday_account_id: 'migrated_v1',
+        company_name: 'Denicx Entertainment'
+      });
+      
+      // Add V1 board access
+      db.addBoardAccess(founderChatId, {
+        board_id: process.env.MONDAY_INQUIRIES_BOARD_ID,
+        board_name: 'Inquiries (V1)',
+        board_kind: 'public',
+        item_count: 0,
+        added_by: founderChatId
+      });
+      
+      db.setDefaultBoard(founderChatId, process.env.MONDAY_INQUIRIES_BOARD_ID);
+    }
+    
+    logger.info('✅ Founder auto-migrated to V2');
+  } catch (error) {
+    logger.error('❌ Founder auto-migration failed:', error.message);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down gracefully...');
+  if (isV2Mode && db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, shutting down gracefully...');
+  if (isV2Mode && db) {
+    await db.close();
+  }
+  process.exit(0);
 });
 
 // ============================================================
