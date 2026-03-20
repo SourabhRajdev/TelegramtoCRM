@@ -707,7 +707,7 @@ app.get('/health', (req, res) => {
     timestamp         : new Date().toISOString(),
     uptime_seconds    : Math.round(process.uptime()),
     conversation_turns: conversationHistory.length,
-    monday_board      : CONFIG.monday.inquiriesBoard,
+    monday_board      : CONFIG.monday.inquiriesBoard || 'not_configured',
     cache_size        : queryCache.size(),
   });
 });
@@ -719,6 +719,11 @@ app.get('/health', (req, res) => {
 async function registerTelegramWebhook() {
   if (!CONFIG.telegram.botToken) {
     logger.warn('No Telegram bot token found — skipping webhook registration');
+    return;
+  }
+
+  if (!process.env.BASE_URL || process.env.BASE_URL.includes('your-railway-domain')) {
+    logger.warn('BASE_URL not configured properly — skipping webhook registration');
     return;
   }
 
