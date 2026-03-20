@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: aria-founder-terminal
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: node aria-founder-terminal.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        generateValue: true
+    healthCheckPath: /health
