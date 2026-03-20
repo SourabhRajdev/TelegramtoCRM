@@ -48,6 +48,7 @@ const Cache               = require('./lib/cache');
 const { logAudit }        = require('./lib/audit');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(helmet());
 
