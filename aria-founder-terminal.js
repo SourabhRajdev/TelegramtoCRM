@@ -955,8 +955,19 @@ async function processMessage(chatId, messageText) {
   }
 
   // Step 3: Send response (no queries needed)
-  // FIX 6: Removed looksLikeDataQuery fallback to prevent dual code paths
-  // Trust Gemini's response - if it didn't generate queries, send its message
+  // Safety net: if AI returned no queries but this looks like a data request, fetch directly
+  const looksLikeDataQuery = /show|list|give|get|how many|who|which|find|search|tasks?|clients?|leads?|artists?|staff|team|assigned|available|status|breakdown|charge|pricing/i.test(messageText);
+  if (looksLikeDataQuery && (!aiResponse.needs_data || !aiResponse.queries || aiResponse.queries.length === 0)) {
+    logger.info('Data query detected but AI returned no queries — forcing fallback fetch');
+    const fallbackResults = await fallbackFetchAll(messageText);
+    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
+      const formattedMessage = formatReadResults(fallbackResults, messageText);
+      await sendTelegramMessage(chatId, formattedMessage);
+      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
+      return;
+    }
+  }
+
   await sendTelegramMessage(chatId, aiResponse.message);
 
   logAudit({
@@ -991,7 +1002,7 @@ function detectBoards(query) {
   const TB = CONFIG.monday.boards.staff;
 
   const staffKeywords = /staff|team|employee|task|working on|hire|agent|manager|admin|department|role/;
-  const salesKeywords = /lead|client|inquiry|deal|prospect|pipeline|proposal|sales|revenue|assigned.*ae|ae\b|follow.?up|contacted/;
+  const salesKeywords = /lead|client|inquiry|deal|prospect|pipeline|proposal|sales|revenue|assigned.*ae|ae\b|follow.?up|contacted|responsible|haven.*contacted|breakdown/;
   const artistKeywords = /artist|talent|performer|dj|vocalist|musician|dancer|saxophone|band|booking|portfolio|available|pricing|charge/;
 
   if (staffKeywords.test(q)) boards.push(TB);
@@ -1030,15 +1041,26 @@ function extractPersonName(query) {
     /(?:tasks?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
     /(?:assigned\s+to)\s+(\w+)/i,
     /(?:clients?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
-    /(\w+)['']s\s+(?:tasks?|clients?|work)/i,
+    /(\w+)[''\u2019]s\s+(?:tasks?|clients?|work)/i,
     /(?:give\s+me\s+the\s+\w+\s+(?:listed|assigned)\s+(?:for|to))\s+(\w+)/i,
+    // "what tasks is X working on" / "what is X working on"
+    /what\s+(?:tasks?\s+)?is\s+(\w+)\s+working/i,
+    // "show X's ..." / "get X's ..."
+    /(?:show|get|find)\s+(\w+)[''\u2019]s/i,
+    // "tasks assigned to X" / "clients assigned to X"
+    /(?:tasks?|clients?|leads?|items?)\s+(?:assigned|given|allocated)\s+to\s+(\w+)/i,
+    // "for X" at end of sentence
+    /(?:tasks?|clients?|leads?|work|projects?)\s+(?:for|of)\s+(\w+)\s*$/i,
+    // "X is working on what"
+    /^(\w+)\s+is\s+working/i,
   ];
+  const stopWords = ['the', 'all', 'my', 'our', 'me', 'any', 'each', 'every', 'show', 'get', 'find',
+    'what', 'how', 'who', 'which', 'give', 'list', 'no', 'not', 'and', 'or', 'them', 'it'];
   for (const pattern of patterns) {
     const match = q.match(pattern);
     if (match && match[1]) {
       const name = match[1].toLowerCase();
-      // Exclude common words that aren't names
-      if (!['the', 'all', 'my', 'our', 'me', 'any', 'each', 'every'].includes(name)) {
+      if (!stopWords.includes(name)) {
         return name;
       }
     }
@@ -1358,18 +1380,34 @@ function formatSingleItem(item, index, isTasksQuery) {
   }
 
   // For general queries, show relevant non-empty columns (excluding Name column)
-  const details = columns
-    .filter(col => {
-      if (!col.text || col.text.trim() === '' || col.id === 'name') return false;
-      const title = getColumnTitle(col.id).toLowerCase();
-      // Skip "Name" column by title as well
-      if (title === 'name' || title === 'full name' || title === 'item name') return false;
-      return true;
-    })
-    .slice(0, 5) // Limit to 5 most relevant columns
+  // Prioritize: status/stage columns first, then assigned/AE, then phone, then others
+  const relevantCols = columns.filter(col => {
+    if (!col.text || col.text.trim() === '' || col.id === 'name') return false;
+    const title = getColumnTitle(col.id).toLowerCase();
+    if (title === 'name' || title === 'full name' || title === 'item name') return false;
+    return true;
+  });
+
+  // Sort by priority: status/stage > assigned > pricing > phone > other
+  relevantCols.sort((a, b) => {
+    const priority = (col) => {
+      const t = getColumnTitle(col.id).toLowerCase();
+      if (t.includes('stage') || t.includes('pipeline')) return 0;
+      if (t.includes('status') || t.includes('availability')) return 1;
+      if (t.includes('assigned') || t.includes('ae')) return 2;
+      if (t.includes('pricing') || t.includes('price')) return 3;
+      if (t.includes('art form') || t.includes('role') || t.includes('department')) return 4;
+      if (t.includes('phone')) return 5;
+      if (t.includes('email')) return 6;
+      return 7;
+    };
+    return priority(a) - priority(b);
+  });
+
+  const details = relevantCols
+    .slice(0, 5)
     .map(col => {
       const colTitle = getColumnTitle(col.id);
-      // FIX 2: Truncate long text at 80 characters
       const colText = col.text.length > 80 ? col.text.substring(0, 77) + '...' : col.text;
       return `${colTitle}: ${colText}`;
     })
