@@ -272,12 +272,18 @@ queries: [
 GRAPHQL REFERENCE — COMPLETE OPERATIONS
 ═══════════════════════════════════════════════════════════════
 
+⚠️ IMPORTANT FETCH STRATEGY:
+For ANY query that involves filtering by status, assigned person, pipeline stage, or any column value:
+→ Use GET ALL ITEMS (limit: 100) — the system will filter locally. DO NOT use query_params with column filters other than "name".
+→ query_params filtering is unreliable for status/text/label columns and often returns empty results.
+→ Only use query_params with column_id "name" and operator "contains_text" for Sales and Artists boards (NOT Staff — Staff uses codes).
+
 ── READ ──────────────────────────────────────────────────────
 
-SEARCH BY NAME:
+SEARCH BY NAME (Sales/Artists only — NOT Staff):
 query { boards(ids: [BOARD_ID]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["TERM"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }
 
-GET ALL ITEMS:
+GET ALL ITEMS (preferred for filtered queries):
 query { boards(ids: [BOARD_ID]) { items_page(limit: 100) { items { id name column_values { id text value type } created_at } } } }
 
 GET RECENT ITEMS:
@@ -812,6 +818,16 @@ async function processMessage(chatId, messageText) {
     // For READ operations: format data directly without second Gemini call
     // For WRITE operations: make second call to confirm execution
     if (aiResponse.action_type === 'read') {
+      // Check if results are empty — if so, try fallback fetch-all from relevant boards
+      let itemCount = countItemsInResults(allResults);
+      if (itemCount === 0) {
+        logger.info('Empty read results, attempting fallback fetch-all');
+        const fallbackResults = await fallbackFetchAll(messageText);
+        if (fallbackResults.length > 0) {
+          allResults = fallbackResults;
+        }
+      }
+
       // Format read results directly
       const formattedMessage = formatReadResults(allResults, messageText);
       await sendTelegramMessage(chatId, formattedMessage);
@@ -837,6 +853,19 @@ async function processMessage(chatId, messageText) {
   }
 
   // Step 3: Send response (no queries needed)
+  // Safety net: if AI says "no items" but this looks like a data query, fetch directly
+  const looksLikeDataQuery = /show|list|give|get|how many|who|which|find|search|tasks?|clients?|leads?|artists?|staff|team|assigned|available|status|breakdown/i.test(messageText);
+  if (looksLikeDataQuery && (!aiResponse.needs_data || aiResponse.queries.length === 0)) {
+    logger.info('Data query detected but AI returned no queries — forcing fallback fetch');
+    const fallbackResults = await fallbackFetchAll(messageText);
+    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
+      const formattedMessage = formatReadResults(fallbackResults, messageText);
+      await sendTelegramMessage(chatId, formattedMessage);
+      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
+      return;
+    }
+  }
+
   await sendTelegramMessage(chatId, aiResponse.message);
 
   logAudit({
@@ -844,6 +873,62 @@ async function processMessage(chatId, messageText) {
     message: messageText,
     queriesExecuted: 0,
   });
+}
+
+// Count items in Monday.com query results
+function countItemsInResults(results) {
+  let count = 0;
+  for (const result of results) {
+    if (!result || result.error) continue;
+    if (result.boards) {
+      for (const board of result.boards) {
+        const items = board.items_page?.items || board.items || [];
+        count += items.length;
+      }
+    }
+    if (result.items) count += result.items.length;
+  }
+  return count;
+}
+
+// Determine which boards to fetch based on the query keywords
+function detectBoards(query) {
+  const q = query.toLowerCase();
+  const boards = [];
+  const SB = CONFIG.monday.boards.sales;
+  const AB = CONFIG.monday.boards.artists;
+  const TB = CONFIG.monday.boards.staff;
+
+  const staffKeywords = /staff|team|employee|task|working on|hire|agent|manager|admin|department|role/;
+  const salesKeywords = /lead|client|inquiry|deal|prospect|pipeline|proposal|sales|revenue|assigned.*ae|ae\b|follow.?up|contacted/;
+  const artistKeywords = /artist|talent|performer|dj|vocalist|musician|dancer|saxophone|band|booking|portfolio|available|pricing|charge/;
+
+  if (staffKeywords.test(q)) boards.push(TB);
+  if (salesKeywords.test(q)) boards.push(SB);
+  if (artistKeywords.test(q)) boards.push(AB);
+
+  // Default: if nothing matched but there's a person name, search staff + sales
+  if (boards.length === 0) {
+    boards.push(TB, SB);
+  }
+
+  return boards;
+}
+
+// Fallback: fetch all items from relevant boards when filtered query returned empty
+async function fallbackFetchAll(originalRequest) {
+  const boards = detectBoards(originalRequest);
+  const results = [];
+
+  for (const board of boards) {
+    const query = `query { boards(ids: [${board.id}]) { items_page(limit: 100) { items { id name column_values { id text value type } } } } }`;
+    const result = await mondayQuery(query);
+    if (result && !result.error) {
+      results.push(result);
+    }
+  }
+
+  return results;
 }
 
 // Extract person name from a natural language query
@@ -867,6 +952,50 @@ function extractPersonName(query) {
       }
     }
   }
+  return null;
+}
+
+// Extract status filter from natural language query
+function extractStatusFilter(query) {
+  const q = query.toLowerCase();
+
+  // "haven't been contacted" / "not contacted" / "not yet contacted"
+  if (/haven'?t\s+been\s+contacted|not\s+(yet\s+)?contacted/i.test(q)) {
+    return { exclude: ['Contacted', 'Proposal Sent', 'Deal Won', 'Deal Lost'] };
+  }
+  // "qualified leads"
+  if (/qualified/i.test(q) && /lead|client|pipeline/i.test(q)) {
+    return { include: ['Qualified'] };
+  }
+  // "new inquiries" / "new leads"
+  if (/new\s+(inquir|lead)/i.test(q)) {
+    return { include: ['New Inquiry'] };
+  }
+  // "contacted leads"
+  if (/contacted/i.test(q) && /lead|client/i.test(q)) {
+    return { include: ['Contacted'] };
+  }
+  // "available artists"
+  if (/available/i.test(q) && /artist|talent|performer/i.test(q)) {
+    return { include: ['Available'] };
+  }
+  // "booked artists"
+  if (/booked/i.test(q) && /artist|talent/i.test(q)) {
+    return { include: ['Booked'] };
+  }
+  // "active staff"
+  if (/active/i.test(q) && /staff|team|employee/i.test(q)) {
+    return { include: ['Active'] };
+  }
+  // "proposal sent"
+  if (/proposal\s+sent/i.test(q)) {
+    return { include: ['Proposal Sent'] };
+  }
+  // "deal won"
+  if (/deal\s+won|won\s+deals?/i.test(q)) {
+    return { include: ['Deal Won'] };
+  }
+
   return null;
 }
 
@@ -925,6 +1054,34 @@ function formatReadResults(results, originalRequest) {
     }
   }
 
+  // Apply status-based local filtering from the query
+  const statusFilter = extractStatusFilter(originalRequest);
+  if (statusFilter) {
+    const filtered = items.filter(item => {
+      const columns = item.column_values || [];
+      // Get all status/color column texts (these are the label columns like Pipeline Stage, Availability, etc.)
+      const statusTexts = columns
+        .filter(col => col.text && (col.id.startsWith('color') || col.id.startsWith('status') ||
+                getColumnTitle(col.id).toLowerCase().includes('stage') ||
+                getColumnTitle(col.id).toLowerCase().includes('status') ||
+                getColumnTitle(col.id).toLowerCase().includes('availability')))
+        .map(col => col.text.toLowerCase());
+
+      if (statusFilter.exclude) {
+        // Item passes if NONE of its status columns match the excluded values
+        return !statusTexts.some(text => statusFilter.exclude.some(s => text === s.toLowerCase()));
+      }
+      if (statusFilter.include) {
+        // Item passes if ANY of its status columns match the included values
+        return statusTexts.some(text => statusFilter.include.some(s => text === s.toLowerCase()));
+      }
+      return true;
+    });
+    if (filtered.length > 0) {
+      items = filtered;
+    }
+  }
+
   // Check if this is a "tasks" query
   const isTasksQuery = /tasks?|working on|assigned to/i.test(originalRequest);
 
@@ -944,37 +1101,59 @@ function formatReadResults(results, originalRequest) {
   }).join('\n\n');
 }
 
+// Helper to get column title from ID
+function getColumnTitle(colId) {
+  for (const boardKey of ['sales', 'artists', 'staff']) {
+    const boardCols = boardColumns[boardKey];
+    if (boardCols) {
+      const col = boardCols.find(c => c.id === colId);
+      if (col) return col.title;
+    }
+  }
+  return colId.replace(/_/g, ' ').replace(/mm1r\w+/g, '').trim() || colId;
+}
+
+// Resolve display name for an item — for staff codes (STF-XXX), extract name from email
+function resolveDisplayName(item) {
+  const rawName = item.name || 'Unnamed';
+  // If it's a staff code like STF-001, try to get a human name from email or other columns
+  if (/^STF-\d+$/i.test(rawName)) {
+    const columns = item.column_values || [];
+    // Try email column first (e.g. "sourabh@denicx.com" → "Sourabh")
+    const emailCol = columns.find(col => col.id && col.id.startsWith('email') && col.text);
+    if (emailCol && emailCol.text) {
+      const localPart = emailCol.text.split('@')[0];
+      return localPart.charAt(0).toUpperCase() + localPart.slice(1) + ` (${rawName})`;
+    }
+    // Fallback: use the role/title column
+    const roleCol = columns.find(col => {
+      const title = getColumnTitle(col.id).toLowerCase();
+      return (title.includes('role') || title.includes('title') || title.includes('designation')) && col.text;
+    });
+    if (roleCol) return `${rawName} — ${roleCol.text}`;
+  }
+  return rawName;
+}
+
 // Format a single item with smart column selection
 function formatSingleItem(item, index, isTasksQuery) {
-  const name = item.name || 'Unnamed';
+  const name = resolveDisplayName(item);
   const columns = item.column_values || [];
-  
-  // Helper to get column title from ID
-  const getColumnTitle = (colId) => {
-    for (const boardKey of ['sales', 'artists', 'staff']) {
-      const boardCols = boardColumns[boardKey];
-      if (boardCols) {
-        const col = boardCols.find(c => c.id === colId);
-        if (col) return col.title;
-      }
-    }
-    return colId.replace(/_/g, ' ').replace(/mm1r\w+/g, '').trim() || colId;
-  };
-  
+
   // For tasks queries, prioritize the "Current Tasks/Projects" column
   if (isTasksQuery) {
     const tasksCol = columns.find(col => {
       const title = getColumnTitle(col.id).toLowerCase();
       return title.includes('task') || title.includes('project') || title.includes('working');
     });
-    
+
     if (tasksCol && tasksCol.text && tasksCol.text.trim()) {
       return `${index}. ${name}\n   Tasks: ${tasksCol.text}`;
     } else {
       return `${index}. ${name}\n   No tasks assigned`;
     }
   }
-  
+
   // For general queries, show relevant non-empty columns
   const details = columns
     .filter(col => col.text && col.text.trim() !== '' && col.id !== 'name')
@@ -984,7 +1163,7 @@ function formatSingleItem(item, index, isTasksQuery) {
       return `${colTitle}: ${col.text}`;
     })
     .join(' | ');
-  
+
   return `${index}. ${name}${details ? '\n   ' + details : ''}`;
 }
 
