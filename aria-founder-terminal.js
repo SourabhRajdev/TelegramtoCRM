@@ -53,17 +53,17 @@ const CONFIG = {
     apiBase: 'https://api.monday.com/v2',
     boards: {
       sales: {
-        id: '5027403736',
+        id: process.env.MONDAY_SALES_BOARD_ID || '5027403736',
         name: 'Denicx Sales Pipeline',
         type: 'sales'
       },
       artists: {
-        id: '5027403725',
+        id: process.env.MONDAY_ARTISTS_BOARD_ID || '5027403725',
         name: 'Denicx Artist Database',
         type: 'artists'
       },
       staff: {
-        id: '5027403709',
+        id: process.env.MONDAY_STAFF_BOARD_ID || '5027403709',
         name: 'Denicx Staff Database',
         type: 'staff'
       }
