@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "monday": {
+      "command": "uvx",
+      "args": ["mcp-server-monday"],
+      "env": {
+        "MONDAY_API_TOKEN": "${MONDAY_API_TOKEN}"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

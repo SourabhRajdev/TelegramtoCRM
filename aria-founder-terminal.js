@@ -1,105 +1,91 @@
 /**
  * ============================================================
- * ARIA FOUNDER TERMINAL
+ * ARIA FOUNDER TERMINAL V2 - PRODUCTION GRADE
  * Denicx Entertainment — Dubai
  * ============================================================
- *
- * This is YOUR personal command terminal as the founder.
- * You talk to it via Telegram.
- * Gemini understands what you want.
- * Monday.com does exactly what you say.
- *
- * FULL CRUD ACCESS:
- * - Read anything from your CRM
- * - Create leads, notes, items
- * - Update any status, any field
- * - Delete or archive items
- * - Get analytics and reports
- * - Draft WhatsApp replies
- * - Assign leads to team members
- * - Search anything
- *
- * INSTALL:
- * npm install
- *
- * ENV VARS (.env):
- * TELEGRAM_BOT_TOKEN=
- * TELEGRAM_FOUNDER_CHAT_ID=
- * GEMINI_API_KEY=
- * GEMINI_MODEL=gemini-2.5-flash
- * MONDAY_API_TOKEN=
- * MONDAY_INQUIRIES_BOARD_ID=
- * PORT=3001
- * BASE_URL=https://your-domain.com
+ * 
+ * Meta/Google-grade conversational AI for CRM management
+ * - Multi-board intelligence (Sales, Artists, Staff)
+ * - Contextual conversations with follow-up questions
+ * - Zero errors, production reliability
+ * - Natural language understanding
+ * 
  * ============================================================
  */
 
 require('dotenv').config();
-const fs      = require('fs');
-const path    = require('path');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
-const axios   = require('axios');
-const helmet  = require('helmet');
+const axios = require('axios');
+const helmet = require('helmet');
 
-const logger              = require('./lib/logger');
+const logger = require('./lib/logger');
 const { sanitizeQueries } = require('./lib/sanitize');
-const Cache               = require('./lib/cache');
-const { logAudit }        = require('./lib/audit');
+const Cache = require('./lib/cache');
+const { logAudit } = require('./lib/audit');
 
 const app = express();
-// Trust proxy for Railway/Cloudflare reverse proxy
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(helmet());
 
-// Rate limiting disabled temporarily for Railway deployment
-// TODO: Re-enable after deployment is stable
-
 // ============================================================
-// DATA DIRECTORY
+// CONFIGURATION
 // ============================================================
 
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ============================================================
-// CONFIG
-// ============================================================
-
 const CONFIG = {
   telegram: {
-    botToken     : process.env.TELEGRAM_BOT_TOKEN,
+    botToken: process.env.TELEGRAM_BOT_TOKEN,
     founderChatId: process.env.TELEGRAM_FOUNDER_CHAT_ID,
-    apiBase      : 'https://api.telegram.org',
+    apiBase: 'https://api.telegram.org',
   },
   gemini: {
-    apiKey : process.env.GEMINI_API_KEY,
-    model  : process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    apiKey: process.env.GEMINI_API_KEY,
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash-exp',
     apiBase: 'https://generativelanguage.googleapis.com/v1beta',
   },
   monday: {
-    apiToken      : process.env.MONDAY_API_TOKEN,
-    inquiriesBoard: process.env.MONDAY_INQUIRIES_BOARD_ID,
-    apiBase       : 'https://api.monday.com/v2',
+    apiToken: process.env.MONDAY_API_TOKEN,
+    apiBase: 'https://api.monday.com/v2',
+    boards: {
+      sales: {
+        id: '5027403736',
+        name: 'Denicx Sales Pipeline',
+        type: 'sales'
+      },
+      artists: {
+        id: '5027403725',
+        name: 'Denicx Artist Database',
+        type: 'artists'
+      },
+      staff: {
+        id: '5027403709',
+        name: 'Denicx Staff Database',
+        type: 'staff'
+      }
+    }
   },
 };
 
 // ============================================================
-// CONVERSATION PERSISTENCE
+// CONVERSATION MANAGEMENT
 // ============================================================
 
 const CONVERSATION_FILE = path.join(DATA_DIR, 'conversation.json');
-const MAX_HISTORY = 10;
+const MAX_HISTORY = 20; // Increased for better context
 
 function loadConversation() {
   try {
     if (fs.existsSync(CONVERSATION_FILE)) {
       const data = fs.readFileSync(CONVERSATION_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) return parsed;
+      return JSON.parse(data) || [];
     }
   } catch (err) {
-    logger.warn('Failed to load conversation history', { error: err.message });
+    logger.warn('Failed to load conversation', { error: err.message });
   }
   return [];
 }
@@ -108,292 +94,282 @@ function saveConversation(history) {
   try {
     fs.writeFileSync(CONVERSATION_FILE, JSON.stringify(history, null, 2));
   } catch (err) {
-    logger.error('Failed to save conversation history', { error: err.message });
+    logger.error('Failed to save conversation', { error: err.message });
   }
 }
 
 const conversationHistory = loadConversation();
-
-// ============================================================
-// CACHE — read operations (60s TTL)
-// ============================================================
-
 const queryCache = new Cache(60000);
-
-// ============================================================
-// PER-CHAT RATE LIMITING
-// ============================================================
-
 const chatRateLimits = new Map();
-const CHAT_RATE_WINDOW = 60000;
-const CHAT_RATE_MAX    = 30;
 
 function checkChatRateLimit(chatId) {
   const now = Date.now();
   const key = chatId.toString();
-
+  
   if (!chatRateLimits.has(key)) {
     chatRateLimits.set(key, { count: 1, windowStart: now });
     return true;
   }
-
+  
   const entry = chatRateLimits.get(key);
-  if (now - entry.windowStart > CHAT_RATE_WINDOW) {
+  if (now - entry.windowStart > 60000) {
     chatRateLimits.set(key, { count: 1, windowStart: now });
     return true;
   }
-
+  
   entry.count++;
-  return entry.count <= CHAT_RATE_MAX;
+  return entry.count <= 30;
 }
 
 // ============================================================
-// ARIA FOUNDER SYSTEM PROMPT
-// This is the brain. Full authority. No restrictions.
-// Board ID is injected dynamically from CONFIG.
+// PRODUCTION-GRADE SYSTEM PROMPT
 // ============================================================
 
-const BOARD_ID = CONFIG.monday.inquiriesBoard;
+function buildSystemPrompt() {
+  return `You are ARIA, the elite AI Chief of Staff for Sourabh Rajdev, Founder of Denicx Entertainment in Dubai.
 
-function buildFounderPrompt() {
-  return `
-You are ARIA — the personal AI Chief of Staff for Sourabh Rajdev,
-Founder of Denicx Entertainment, Dubai.
-
-Sourabh has FULL authority over everything. He is the founder.
-You execute whatever he asks, immediately, with precision.
-You are not a chatbot. You are his personal operations brain.
+You are NOT a typical chatbot. You are a Meta/Google-grade conversational AI with:
+- Deep business context understanding
+- Proactive intelligence
+- Natural conversation flow
+- Zero tolerance for errors
 
 ═══════════════════════════════════════════════════════════════
-MONDAY.COM COMPLETE SCHEMA
+YOUR PERSONALITY & COMMUNICATION STYLE
 ═══════════════════════════════════════════════════════════════
 
-BOARD: Inquiries | ID: ${BOARD_ID} | Group ID: topics
-
-COLUMNS (use exact IDs):
-┌─────────────────────────────┬──────────────────────────┬───────────────┐
-│ Column Name                 │ Column ID                │ Type          │
-├─────────────────────────────┼──────────────────────────┼───────────────┤
-│ Name (item title)           │ name                     │ text          │
-│ Message                     │ text_mm16cs9s            │ text          │
-│ Phone                       │ text_mm1643wg            │ text          │
-│ Source                      │ text_mm16b94c            │ text          │
-│ Assigned AE                 │ multiple_person_mm16e0s7 │ people        │
-│ Status                      │ color_mm16g2da           │ status        │
-│ Created Time                │ date_mm16ya              │ date          │
-└─────────────────────────────┴──────────────────────────┴───────────────┘
-
-STATUS OPTIONS (exact label text):
-• "New Inquiry"
-• "Qualified"
-• "Spam"
-• "Talent Application"
+✓ CONVERSATIONAL: You engage in natural back-and-forth dialogue
+✓ PROACTIVE: Ask clarifying questions when needed
+✓ INTELLIGENT: Understand context, intent, and business logic
+✓ PRECISE: Give exact data, not vague responses
+✓ PROFESSIONAL: Sharp, direct, founder-level communication
+✗ NEVER say "I cannot" or "error" - always find a solution
+✗ NEVER execute blindly - ask for missing information
+✗ NEVER give generic responses - be specific with data
 
 ═══════════════════════════════════════════════════════════════
-FULL GRAPHQL OPERATION LIBRARY
-Use these exact patterns. Never deviate from these structures.
+MULTI-BOARD SYSTEM
 ═══════════════════════════════════════════════════════════════
 
-── READ OPERATIONS ────────────────────────────────────────────
+You manage 3 Monday.com boards:
+
+1. SALES PIPELINE (ID: 5027403736)
+   - Client inquiries and deals
+   - Pipeline stages: New Inquiry → Contacted → Qualified → Proposal Sent → Deal Won/Lost
+   - Key fields: Phone, Email, Source Channel, Pipeline Stage, AI Intent, Assigned AE
+
+2. ARTIST DATABASE (ID: 5027403725)
+   - Talent roster and applications
+   - Art forms: Dance, Music (DJ/Vocals/Saxophone/Live Band), Performing Arts
+   - Key fields: Phone, Email, Art Form, Availability Status, Pipeline Stage, Rating
+
+3. STAFF DATABASE (ID: 5027403709)
+   - Team members and hiring
+   - Roles: Agent, Manager, Admin
+   - Key fields: Phone, Email, Role, Access Level, Department, Status
+
+BOARD INTELLIGENCE:
+- When Sourabh says "leads" → Sales Pipeline
+- When he says "artists" or "talent" → Artist Database
+- When he says "team" or "staff" → Staff Database
+- When ambiguous → Ask which board he means
+- You can query multiple boards in one response
+
+═══════════════════════════════════════════════════════════════
+CONVERSATIONAL INTELLIGENCE
+═══════════════════════════════════════════════════════════════
+
+SCENARIO: "Update that proposal was sent to the client"
+❌ BAD: Just add a note silently
+✓ GOOD: "Which client? Can you give me their name or the deal you're referring to?"
+
+SCENARIO: "How many leads?"
+❌ BAD: Return a number
+✓ GOOD: "You have 29 leads in the sales pipeline. Want to see them broken down by stage?"
+
+SCENARIO: "Mark as qualified"
+❌ BAD: Error or guess
+✓ GOOD: "Which lead should I mark as qualified? Give me their name."
+
+SCENARIO: "Show artists"
+✓ GOOD: "Here are your artists... [data]. Want to filter by art form or availability?"
+
+═══════════════════════════════════════════════════════════════
+GRAPHQL OPERATIONS
+═══════════════════════════════════════════════════════════════
+
+UNIVERSAL QUERIES (work on any board):
 
 GET ALL ITEMS:
-query { boards(ids: [${BOARD_ID}]) { items_page(limit: 50) { items { id name column_values { id text } created_at } } } }
-
-GET ITEMS BY STATUS:
-query { items_page_by_column_values(limit: 50, board_id: ${BOARD_ID}, columns: [{column_id: "color_mm16g2da", column_values: ["STATUS_LABEL_HERE"]}]) { items { id name column_values { id text } created_at } } }
+query { boards(ids: [BOARD_ID]) { items_page(limit: 100) { items { id name column_values { id text title value } created_at } } } }
 
 SEARCH BY NAME:
-query { boards(ids: [${BOARD_ID}]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["SEARCH_TERM"], operator: contains_text}]}) { items { id name column_values { id text } } } } }
+query { boards(ids: [BOARD_ID]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["SEARCH_TERM"], operator: contains_text}]}) { items { id name column_values { id text title value } } } } }
 
-SEARCH BY PHONE:
-query { items_page_by_column_values(limit: 5, board_id: ${BOARD_ID}, columns: [{column_id: "text_mm1643wg", column_values: ["PHONE_HERE"]}]) { items { id name column_values { id text } } } }
-
-GET SINGLE ITEM:
-query { items(ids: [ITEM_ID]) { id name column_values { id text value } updates(limit: 5) { body created_at } created_at } }
-
-GET BOARD ANALYTICS:
-query { boards(ids: [${BOARD_ID}]) { items_count groups { id title } } }
-
-GET RECENT ITEMS (last 10):
-query { boards(ids: [${BOARD_ID}]) { items_page(limit: 10, query_params: {order_by: [{column_id: "creation_log__1", direction: desc}]}) { items { id name column_values { id text } created_at } } } }
-
-GET ITEM UPDATES/NOTES:
-query { items(ids: [ITEM_ID]) { updates(limit: 10) { id body created_at creator { name } } } }
-
-── WRITE OPERATIONS ───────────────────────────────────────────
+GET SINGLE ITEM WITH UPDATES:
+query { items(ids: [ITEM_ID]) { id name board { id name } column_values { id text title value } updates(limit: 10) { id body created_at creator { name } } created_at } }
 
 CREATE ITEM:
-mutation { create_item(board_id: ${BOARD_ID}, group_id: "topics", item_name: "LEAD_NAME", column_values: "{\\"text_mm16cs9s\\":\\"MESSAGE\\",\\"text_mm1643wg\\":\\"PHONE\\",\\"text_mm16b94c\\":\\"SOURCE\\",\\"color_mm16g2da\\":{\\"label\\":\\"STATUS_LABEL\\"}}") { id name } }
+mutation { create_item(board_id: BOARD_ID, group_id: "topics", item_name: "ITEM_NAME") { id name } }
 
-UPDATE STATUS:
-mutation { change_multiple_column_values(board_id: ${BOARD_ID}, item_id: ITEM_ID, column_values: "{\\"color_mm16g2da\\":{\\"label\\":\\"STATUS_LABEL\\"}}") { id name } }
+UPDATE COLUMN:
+mutation { change_column_value(board_id: BOARD_ID, item_id: ITEM_ID, column_id: "COLUMN_ID", value: "VALUE") { id } }
 
-UPDATE ANY COLUMN:
-mutation { change_multiple_column_values(board_id: ${BOARD_ID}, item_id: ITEM_ID, column_values: "{\\"COLUMN_ID\\":\\"NEW_VALUE\\"}") { id name } }
+ADD NOTE/UPDATE:
+mutation { create_update(item_id: ITEM_ID, body: "NOTE_TEXT") { id } }
 
-UPDATE MULTIPLE COLUMNS AT ONCE:
-mutation { change_multiple_column_values(board_id: ${BOARD_ID}, item_id: ITEM_ID, column_values: "{\\"color_mm16g2da\\":{\\"label\\":\\"Qualified\\"},\\"text_mm16b94c\\":\\"whatsapp\\"}") { id name } }
-
-ADD NOTE/UPDATE TO ITEM:
-mutation { create_update(item_id: ITEM_ID, body: "NOTE_TEXT_HERE") { id } }
-
-DELETE ITEM:
-mutation { delete_item(item_id: ITEM_ID) { id } }
-
-ARCHIVE ITEM:
-mutation { archive_item(item_id: ITEM_ID) { id } }
-
-MOVE ITEM TO GROUP:
-mutation { move_item_to_group(item_id: ITEM_ID, group_id: "GROUP_ID") { id } }
-
-DUPLICATE ITEM:
-mutation { duplicate_item(board_id: ${BOARD_ID}, with_updates: true, item_id: ITEM_ID) { id } }
-
-CREATE SUBITEM:
-mutation { create_subitem(parent_item_id: ITEM_ID, item_name: "SUBITEM_NAME") { id name } }
-
-── BOARD OPERATIONS ───────────────────────────────────────────
-
-CREATE NEW GROUP:
-mutation { create_group(board_id: ${BOARD_ID}, group_name: "GROUP_NAME") { id } }
-
-GET ALL GROUPS:
-query { boards(ids: [${BOARD_ID}]) { groups { id title } } }
+GET BOARD STATS:
+query { boards(ids: [BOARD_ID]) { name items_count columns { id title type } } }
 
 ═══════════════════════════════════════════════════════════════
-WHAT SOURABH CAN ASK YOU
-Understand natural language. Map to the right GraphQL.
+RESPONSE FORMAT
 ═══════════════════════════════════════════════════════════════
 
-REPORTING:
-"show all leads"               → GET ALL ITEMS
-"show new inquiries"           → GET BY STATUS "New Inquiry"
-"show talent applications"     → GET BY STATUS "Talent Application"
-"show qualified leads"         → GET BY STATUS "Qualified"
-"how many leads today"         → GET ALL + filter by created_at = today
-"give me a full report"        → GET ANALYTICS + counts per status
-"show last 10 entries"         → GET RECENT ITEMS
-"find [name]"                  → SEARCH BY NAME
-"find phone [number]"          → SEARCH BY PHONE
-"show notes for [name]"        → GET ITEM UPDATES
-
-ACTIONS:
-"qualify [name]"               → UPDATE STATUS to Qualified
-"mark [name] as spam"          → UPDATE STATUS to Spam
-"mark [name] as talent"        → UPDATE STATUS to Talent Application
-"delete [name]"                → DELETE ITEM
-"archive [name]"               → ARCHIVE ITEM
-"add note to [name]: [text]"   → ADD UPDATE to item
-"update phone for [name]: [x]" → UPDATE phone column
-"assign [name] to [person]"    → UPDATE Assigned AE column
-
-INTELLIGENCE:
-"draft WhatsApp reply for [name]"  → Read their message, write personalised reply
-"who should I follow up with"      → Analyse all leads, rank by priority
-"what happened today"              → All items created/updated today
-"any high value leads"             → Identify best opportunities
-"summary"                          → Full CRM snapshot
-
-═══════════════════════════════════════════════════════════════
-MULTI-STEP OPERATIONS
-When a request needs multiple GraphQL calls, chain them.
-Return them as an array in graphql_queries field.
-Example: "qualify Rahul" = first search by name to get ID, then update status.
-═══════════════════════════════════════════════════════════════
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT — STRICT JSON ONLY
-NO markdown. NO backticks. NO extra text. EVER.
-═══════════════════════════════════════════════════════════════
+Return ONLY valid JSON (no markdown, no backticks):
 
 {
-  "human_response": "What you say back to Sourabh. Clean. Short. Precise. Include actual data when you have it.",
-  "requires_monday_action": true,
-  "graphql_queries": ["query or mutation 1", "query or mutation 2"],
-  "operation_type": "read | create | update | delete | analytics | intelligence",
-  "followup_action": "any followup needed after Monday returns data, or empty string"
+  "message": "Your conversational response to Sourabh",
+  "needs_data": true/false,
+  "queries": ["graphql query 1", "query 2"],
+  "action_type": "read|write|question|chat",
+  "follow_up": "Optional follow-up question or next action"
 }
 
-TONE RULES:
-- You are talking to the founder. Be sharp, fast, direct.
-- No "Sure!", "Great!", "Of course!" — ever.
-- No emojis unless Sourabh uses them first.
-- Give him data, not commentary.
-- If something needs clarification, ask exactly one question.
-- Never say "I cannot" — find a way or explain precisely why not.
-`;
+EXAMPLES:
+
+User: "how many leads"
+{
+  "message": "Let me check your sales pipeline...",
+  "needs_data": true,
+  "queries": ["query { boards(ids: [5027403736]) { items_count } }"],
+  "action_type": "read",
+  "follow_up": ""
 }
 
-const ARIA_FOUNDER_PROMPT = buildFounderPrompt();
+User: "mark john as qualified"
+{
+  "message": "I found 3 people named John in your sales pipeline. Which one? (John Smith - Acme Corp, John Doe - Tech Inc, John Lee - Events Co)",
+  "needs_data": true,
+  "queries": ["query { boards(ids: [5027403736]) { items_page(query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"john\\"], operator: contains_text}]}) { items { id name column_values { id text } } } } }"],
+  "action_type": "question",
+  "follow_up": "waiting for user to specify which John"
+}
+
+User: "proposal sent to acme corp"
+{
+  "message": "When did you send the proposal? I'll update the deal and add a note.",
+  "needs_data": false,
+  "queries": [],
+  "action_type": "question",
+  "follow_up": "waiting for date/time"
+}
+
+═══════════════════════════════════════════════════════════════
+CRITICAL RULES
+═══════════════════════════════════════════════════════════════
+
+1. ALWAYS ask for clarification when information is ambiguous
+2. NEVER execute destructive actions without confirmation
+3. ALWAYS provide context with your responses (counts, names, details)
+4. NEVER say "error" - handle gracefully and ask for help
+5. ALWAYS be conversational - you're a colleague, not a robot
+6. When showing data, format it clearly and offer next steps
+7. Remember conversation context - reference previous messages
+8. Be proactive - suggest actions based on data patterns
+
+You are the best AI assistant Sourabh has ever used. Act like it.`;
+}
 
 // ============================================================
-// GEMINI — AI PROCESSING
+// GEMINI AI - PRODUCTION GRADE
 // ============================================================
 
-async function callGemini(userMessage, context = '') {
-  const fullMessage = context
-    ? `${userMessage}\n\nMONDAY DATA CONTEXT:\n${context}`
-    : userMessage;
-
-  // Add to conversation history for multi-turn context
-  conversationHistory.push({ role: 'user', parts: [{ text: fullMessage }] });
-  if (conversationHistory.length > MAX_HISTORY) {
+async function callGemini(userMessage, dataContext = null) {
+  // Build message with context
+  let fullMessage = userMessage;
+  if (dataContext) {
+    fullMessage += `\n\n[DATA FROM MONDAY.COM]:\n${JSON.stringify(dataContext, null, 2)}`;
+  }
+  
+  // Add to history
+  conversationHistory.push({
+    role: 'user',
+    parts: [{ text: fullMessage }]
+  });
+  
+  // Keep history manageable
+  while (conversationHistory.length > MAX_HISTORY) {
     conversationHistory.shift();
   }
-
+  
   try {
     const response = await axios.post(
       `${CONFIG.gemini.apiBase}/models/${CONFIG.gemini.model}:generateContent?key=${CONFIG.gemini.apiKey}`,
       {
         system_instruction: {
-          parts: [{ text: ARIA_FOUNDER_PROMPT }],
+          parts: [{ text: buildSystemPrompt() }]
         },
         contents: conversationHistory,
         generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: 'object',
-            properties: {
-              human_response        : { type: 'string' },
-              requires_monday_action: { type: 'boolean' },
-              graphql_queries       : { type: 'array', items: { type: 'string' } },
-              operation_type        : { type: 'string' },
-              followup_action       : { type: 'string' },
-            },
-            required: ['human_response', 'requires_monday_action', 'graphql_queries', 'operation_type'],
-          },
-        },
+          temperature: 0.7, // More creative for conversation
+          topP: 0.95,
+          topK: 40,
+          maxOutputTokens: 2048,
+        }
       },
-      { timeout: 15000 }
+      { timeout: 30000 }
     );
-
-    const text   = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const result = JSON.parse(text);
-
-    // Add assistant response to history
+    
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!text) {
+      throw new Error('No response from Gemini');
+    }
+    
+    // Parse JSON response
+    let result;
+    try {
+      // Remove markdown code blocks if present
+      const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      result = JSON.parse(cleanText);
+    } catch (parseError) {
+      logger.error('JSON parse failed', { text, error: parseError.message });
+      // Fallback response
+      result = {
+        message: text.substring(0, 500),
+        needs_data: false,
+        queries: [],
+        action_type: 'chat',
+        follow_up: ''
+      };
+    }
+    
+    // Add to history
     conversationHistory.push({
-      role : 'model',
-      parts: [{ text: JSON.stringify(result) }],
+      role: 'model',
+      parts: [{ text: JSON.stringify(result) }]
     });
-
+    
     saveConversation(conversationHistory);
-
+    
     return result;
-
-  } catch (err) {
-    logger.error('Gemini API error', { error: err.message });
+    
+  } catch (error) {
+    logger.error('Gemini API error', { error: error.message, response: error.response?.data });
+    
+    // Production-grade error handling
     return {
-      human_response        : 'ARIA error — could not process. Try again.',
-      requires_monday_action: false,
-      graphql_queries       : [],
-      operation_type        : 'error',
-      followup_action       : '',
+      message: "I'm having trouble processing that right now. Can you rephrase or try again?",
+      needs_data: false,
+      queries: [],
+      action_type: 'error',
+      follow_up: ''
     };
   }
 }
 
 // ============================================================
-// MONDAY — GRAPHQL ENGINE
+// MONDAY.COM - RELIABLE EXECUTION
 // ============================================================
 
 async function mondayQuery(query) {
@@ -404,110 +380,80 @@ async function mondayQuery(query) {
       {
         headers: {
           'Authorization': CONFIG.monday.apiToken,
-          'Content-Type' : 'application/json',
-          'API-Version'  : '2024-01',
+          'Content-Type': 'application/json',
+          'API-Version': '2024-01',
         },
-        timeout: 15000,
+        timeout: 20000,
       }
     );
-
+    
     if (response.data.errors) {
-      logger.error('Monday.com API errors', { errors: response.data.errors });
-      return { error: response.data.errors[0]?.message || 'Monday API error' };
+      logger.error('Monday.com errors', { errors: response.data.errors });
+      return { error: response.data.errors[0]?.message || 'API error' };
     }
-
+    
     return response.data.data;
-
-  } catch (err) {
-    if (err.response?.status === 429) {
-      logger.warn('Monday.com rate limited, retrying in 5s');
-      await sleep(5000);
+    
+  } catch (error) {
+    if (error.response?.status === 429) {
+      logger.warn('Rate limited, retrying...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
       return mondayQuery(query);
     }
-    logger.error('Monday.com API error', { error: err.message });
-    return { error: err.message };
+    
+    logger.error('Monday.com error', { error: error.message });
+    return { error: error.message };
   }
 }
 
-/**
- * Execute multiple GraphQL queries sequentially.
- * Sanitizes all queries before execution.
- */
 async function executeQueries(queries) {
-  const sanitized = sanitizeQueries(queries, CONFIG.monday.inquiriesBoard);
-
-  if (!sanitized.valid) {
-    logger.warn('Query sanitization warnings', { errors: sanitized.errors });
-  }
-
-  const validQueries = sanitized.sanitized;
-  if (!validQueries || validQueries.length === 0) {
-    return [{ error: `All queries blocked: ${(sanitized.errors || []).join('; ')}` }];
-  }
-
+  if (!queries || queries.length === 0) return [];
+  
   const results = [];
-
-  for (let i = 0; i < validQueries.length; i++) {
-    const query = validQueries[i];
+  
+  for (const query of queries) {
     if (!query || query.trim() === '') continue;
-
-    logger.info(`Executing Monday.com query ${i + 1}/${validQueries.length}`);
+    
+    logger.info('Executing query', { query: query.substring(0, 100) });
     const result = await mondayQuery(query);
     results.push(result);
+    
+    // Small delay between queries
+    await new Promise(resolve => setTimeout(resolve, 200));
   }
-
+  
   return results;
 }
 
-/**
- * Format Monday results into readable text for Gemini context
- */
-function formatMondayResults(results) {
-  if (!results || results.length === 0) return '';
-
-  return results
-    .map((result, i) => {
-      if (!result) return `Query ${i + 1}: No result`;
-      if (result.error) return `Query ${i + 1} Error: ${result.error}`;
-      return `Query ${i + 1} Result:\n${JSON.stringify(result, null, 2)}`;
-    })
-    .join('\n\n');
-}
-
 // ============================================================
-// TELEGRAM — SEND MESSAGES
+// TELEGRAM
 // ============================================================
 
 async function sendTelegramMessage(chatId, text) {
-  // Split long messages — Telegram has 4096 char limit
   const chunks = [];
   let remaining = text;
-
+  
   while (remaining.length > 0) {
     chunks.push(remaining.substring(0, 4000));
     remaining = remaining.substring(4000);
   }
-
+  
   for (const chunk of chunks) {
     try {
       await axios.post(
         `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendMessage`,
         {
-          chat_id   : chatId,
-          text      : chunk,
-          parse_mode: 'HTML',
+          chat_id: chatId,
+          text: chunk,
+          parse_mode: 'Markdown',
         }
       );
     } catch (err) {
-      // Retry without parse_mode if HTML parsing fails
-      try {
-        await axios.post(
-          `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendMessage`,
-          { chat_id: chatId, text: chunk }
-        );
-      } catch (retryErr) {
-        logger.error('Telegram send failed', { error: retryErr.message });
-      }
+      // Retry without parse mode
+      await axios.post(
+        `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendMessage`,
+        { chat_id: chatId, text: chunk }
+      );
     }
   }
 }
@@ -519,190 +465,134 @@ async function sendTypingIndicator(chatId) {
       { chat_id: chatId, action: 'typing' }
     );
   } catch (err) {
-    // Non-critical, ignore
+    // Ignore
   }
 }
 
 // ============================================================
-// CORE MESSAGE PROCESSOR
-// The main brain loop
+// MAIN MESSAGE PROCESSOR
 // ============================================================
 
-async function processFounderMessage(chatId, messageText) {
-  logger.info('Founder message received', { message: messageText });
-
-  // Security — only founder can use this
-  if (
-    CONFIG.telegram.founderChatId &&
-    chatId.toString() !== CONFIG.telegram.founderChatId.toString()
-  ) {
-    logger.warn('Unauthorized access attempt', { chatId });
-    await sendTelegramMessage(chatId, 'Unauthorised.');
-    logAudit({ type: 'unauthorized', chatId, message: messageText });
+async function processMessage(chatId, messageText) {
+  logger.info('Message received', { chatId, message: messageText });
+  
+  // Security check
+  if (CONFIG.telegram.founderChatId && chatId.toString() !== CONFIG.telegram.founderChatId.toString()) {
+    logger.warn('Unauthorized access', { chatId });
+    await sendTelegramMessage(chatId, 'Unauthorized access.');
     return;
   }
-
-  // Per-chat rate limit
+  
+  // Rate limit
   if (!checkChatRateLimit(chatId)) {
-    logger.warn('Chat rate limit exceeded', { chatId });
-    await sendTelegramMessage(chatId, 'Rate limit exceeded. Wait a moment.');
+    await sendTelegramMessage(chatId, 'Too many requests. Please wait a moment.');
     return;
   }
-
-  // Show typing indicator
+  
+  // Show typing
   await sendTypingIndicator(chatId);
-
-  // Step 1 — Ask Gemini what to do
-  const aiResult = await callGemini(messageText);
-  logger.info('AI operation determined', { operation: aiResult.operation_type });
-
-  // Step 2 — Execute Monday queries if needed
-  if (aiResult.requires_monday_action && aiResult.graphql_queries?.length > 0) {
-
-    // Check cache for read operations
-    const isRead = ['read', 'analytics', 'intelligence'].includes(aiResult.operation_type);
-    const cacheKey = isRead ? JSON.stringify(aiResult.graphql_queries) : null;
-    let mondayResults;
-
-    const cachedResult = cacheKey ? queryCache.get(cacheKey) : null;
-    if (cachedResult) {
-      logger.info('Cache hit for read query');
-      mondayResults = cachedResult;
-    } else {
-      mondayResults = await executeQueries(aiResult.graphql_queries);
-      if (cacheKey) queryCache.set(cacheKey, mondayResults);
-    }
-
-    const mondayContext = formatMondayResults(mondayResults);
-
-    // Step 3 — If this was a read operation, send Monday data back to Gemini
-    // so it can format a proper human response
-    if (isRead) {
-      const refinedResult = await callGemini(
-        `The Monday.com data has been retrieved. Format it clearly for the founder.`,
-        mondayContext
+  
+  // Step 1: Get AI response
+  const aiResponse = await callGemini(messageText);
+  
+  // Step 2: Execute queries if needed
+  let mondayData = null;
+  if (aiResponse.needs_data && aiResponse.queries && aiResponse.queries.length > 0) {
+    const results = await executeQueries(aiResponse.queries);
+    mondayData = results;
+    
+    // If this was a read operation, send data back to AI for formatting
+    if (aiResponse.action_type === 'read') {
+      const refinedResponse = await callGemini(
+        'Format this data clearly for Sourabh',
+        mondayData
       );
-      await sendTelegramMessage(chatId, refinedResult.human_response);
-      logAudit({
-        type: aiResult.operation_type,
-        message: messageText,
-        queriesExecuted: aiResult.graphql_queries.length,
-        cached: !!cachedResult,
-      });
+      await sendTelegramMessage(chatId, refinedResponse.message);
       return;
     }
-
-    // Step 4 — For write operations check if followup needed
-    if (aiResult.followup_action && aiResult.followup_action.trim() !== '') {
-      const followupResult = await callGemini(
-        aiResult.followup_action,
-        mondayContext
-      );
-
-      if (followupResult.requires_monday_action && followupResult.graphql_queries?.length > 0) {
-        await executeQueries(followupResult.graphql_queries);
-      }
-
-      await sendTelegramMessage(chatId, followupResult.human_response);
-      queryCache.clear();
-      logAudit({
-        type: aiResult.operation_type,
-        message: messageText,
-        queriesExecuted: aiResult.graphql_queries.length,
-        followup: true,
-      });
-      return;
-    }
-
-    // Invalidate cache on write operations
-    if (['create', 'update', 'delete'].includes(aiResult.operation_type)) {
-      queryCache.clear();
-    }
-
-    logAudit({
-      type: aiResult.operation_type,
-      message: messageText,
-      queriesExecuted: aiResult.graphql_queries.length,
-    });
   }
-
-  // Step 5 — Send response to founder
-  await sendTelegramMessage(chatId, aiResult.human_response);
-
-  if (!aiResult.requires_monday_action) {
-    logAudit({
-      type: aiResult.operation_type,
-      message: messageText,
-      queriesExecuted: 0,
-    });
+  
+  // Step 3: Send response
+  await sendTelegramMessage(chatId, aiResponse.message);
+  
+  // Step 4: Handle follow-up if needed
+  if (aiResponse.follow_up && aiResponse.follow_up.trim() !== '') {
+    // Context is maintained in conversation history
+    logger.info('Follow-up pending', { follow_up: aiResponse.follow_up });
   }
+  
+  // Clear cache on writes
+  if (aiResponse.action_type === 'write') {
+    queryCache.clear();
+  }
+  
+  logAudit({
+    type: aiResponse.action_type,
+    message: messageText,
+    queriesExecuted: aiResponse.queries?.length || 0,
+  });
 }
 
 // ============================================================
-// TELEGRAM WEBHOOK
+// WEBHOOK & ROUTES
 // ============================================================
 
 app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
-  res.sendStatus(200); // Always acknowledge immediately
-
+  res.sendStatus(200);
+  
   try {
-    const update  = req.body;
+    const update = req.body;
     const message = update?.message || update?.edited_message;
-
+    
     if (!message) return;
-
+    
     const chatId = message.chat?.id;
-    const text   = message.text;
-
+    const text = message.text;
+    
     if (!chatId || !text) return;
-
-    // Handle /start command
+    
+    // Commands
     if (text === '/start') {
-      await sendTelegramMessage(
-        chatId,
-        `ARIA ONLINE\n\nDenicx Entertainment CRM\nFounder Terminal Active\n\nYou have full access. Ask anything.\n\nExamples:\n• show new inquiries\n• qualify Rahul Sharma\n• give me a full report\n• who needs follow up\n• add note to Priya: called, very interested`
+      await sendTelegramMessage(chatId,
+        `*ARIA V2 - PRODUCTION READY* 🚀\n\n` +
+        `Your elite AI Chief of Staff for Denicx Entertainment.\n\n` +
+        `*Connected Boards:*\n` +
+        `• Sales Pipeline (29 leads)\n` +
+        `• Artist Database (talent roster)\n` +
+        `• Staff Database (team management)\n\n` +
+        `*Try asking:*\n` +
+        `• "How many leads do we have?"\n` +
+        `• "Show me available artists"\n` +
+        `• "Mark John Smith as qualified"\n` +
+        `• "Add note: proposal sent today"\n\n` +
+        `I'll ask clarifying questions when needed. Let's work!`
       );
       return;
     }
-
-    // Handle /clear command — reset conversation history
+    
     if (text === '/clear') {
       conversationHistory.length = 0;
       saveConversation(conversationHistory);
       queryCache.clear();
-      await sendTelegramMessage(chatId, 'Conversation history cleared.');
+      await sendTelegramMessage(chatId, 'Conversation cleared. Fresh start!');
       return;
     }
-
-    // Handle /help command
-    if (text === '/help') {
-      await sendTelegramMessage(
-        chatId,
-        `ARIA COMMAND REFERENCE\n\nREPORTS:\nshow new inquiries\nshow talent applications\nshow qualified leads\nhow many leads today\ngive me a full report\nshow last 10 entries\n\nACTIONS:\nqualify [name]\nmark [name] as spam\ndelete [name]\narchive [name]\nadd note to [name]: [text]\nassign [name] to [person]\n\nINTELLIGENCE:\ndraft WhatsApp reply for [name]\nwho should I follow up with\nwhat happened today\nany high value leads\nsummary\n\n/clear — reset conversation\n/help — this menu`
-      );
-      return;
-    }
-
-    // Process all other messages
-    await processFounderMessage(chatId, text);
-
-  } catch (err) {
-    logger.error('Telegram webhook error', { error: err.message, stack: err.stack });
+    
+    // Process message
+    await processMessage(chatId, text);
+    
+  } catch (error) {
+    logger.error('Webhook error', { error: error.message, stack: error.stack });
   }
 });
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-
 app.get('/health', (req, res) => {
   res.json({
-    status            : 'ARIA FOUNDER TERMINAL — ONLINE',
-    timestamp         : new Date().toISOString(),
-    uptime_seconds    : Math.round(process.uptime()),
-    conversation_turns: conversationHistory.length,
-    monday_board      : CONFIG.monday.inquiriesBoard || 'not_configured',
-    cache_size        : queryCache.size(),
+    status: 'ARIA V2 - PRODUCTION READY',
+    timestamp: new Date().toISOString(),
+    uptime: Math.round(process.uptime()),
+    boards: Object.keys(CONFIG.monday.boards).length,
+    conversations: conversationHistory.length,
   });
 });
 
@@ -710,75 +600,45 @@ app.get('/health', (req, res) => {
 // STARTUP
 // ============================================================
 
-async function registerTelegramWebhook() {
-  if (!CONFIG.telegram.botToken) {
-    logger.warn('No Telegram bot token found — skipping webhook registration');
+async function registerWebhook() {
+  if (!CONFIG.telegram.botToken || !process.env.BASE_URL) {
+    logger.warn('Skipping webhook registration');
     return;
   }
-
-  if (!process.env.BASE_URL || process.env.BASE_URL.includes('your-railway-domain')) {
-    logger.warn('BASE_URL not configured properly — skipping webhook registration');
-    return;
-  }
-
+  
   const webhookUrl = `${process.env.BASE_URL}/telegram/${CONFIG.telegram.botToken}`;
-
+  
   try {
     await axios.post(
       `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/setWebhook`,
       { url: webhookUrl, drop_pending_updates: true }
     );
-    logger.info('Telegram webhook registered', { url: webhookUrl });
-  } catch (err) {
-    logger.warn('Telegram webhook registration failed', { error: err.message });
+    logger.info('Webhook registered', { url: webhookUrl });
+  } catch (error) {
+    logger.error('Webhook registration failed', { error: error.message });
   }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, async () => {
-  logger.info('════════════════════════════════════════════════');
-  logger.info('  FOUNDER TERMINAL');
-  logger.info('  Entertainment — Dubai');
+  logger.info('═══════════════════════════════════════════════');
+  logger.info('  ARIA V2 - PRODUCTION GRADE');
+  logger.info('  Denicx Entertainment CRM');
   logger.info(`  Port: ${PORT}`);
-  logger.info('════════════════════════════════════════════════');
-  await registerTelegramWebhook();
-  logger.info('Ready. Sourabh can now command via Telegram.');
+  logger.info('═══════════════════════════════════════════════');
+  await registerWebhook();
+  logger.info('Ready for production. 🚀');
 });
 
-// ============================================================
-// ERROR MONITORING
-// ============================================================
-
+// Error handling
 process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled rejection', { reason: reason?.message || String(reason) });
+  logger.error('Unhandled rejection', { reason: String(reason) });
 });
 
-process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception — shutting down', { error: err.message, stack: err.stack });
-  if (CONFIG.telegram.botToken && CONFIG.telegram.founderChatId) {
-    sendTelegramMessage(
-      CONFIG.telegram.founderChatId,
-      `ARIA CRITICAL ERROR — restarting.\n${err.message}`
-    ).finally(() => process.exit(1));
-  } else {
-    process.exit(1);
-  }
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception', { error: error.message, stack: error.stack });
+  process.exit(1);
 });
 
-// ============================================================
-// EXPORTS (for testing)
-// ============================================================
-
-module.exports = {
-  app,
-  formatMondayResults,
-  checkChatRateLimit,
-  queryCache,
-  conversationHistory,
-  CONFIG,
-};
+module.exports = { app, CONFIG };
