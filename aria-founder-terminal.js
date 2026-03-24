@@ -732,20 +732,16 @@ async function sendTelegramMessage(chatId, text) {
   
   for (const chunk of chunks) {
     try {
+      // FIX 4: Remove Markdown parse mode - user data is untrusted and can break formatting
       await axios.post(
         `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendMessage`,
         {
           chat_id: chatId,
           text: chunk,
-          parse_mode: 'Markdown',
         }
       );
     } catch (err) {
-      // Retry without parse mode
-      await axios.post(
-        `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendMessage`,
-        { chat_id: chatId, text: chunk }
-      );
+      logger.error('Failed to send Telegram message', { error: err.message });
     }
   }
 }
@@ -853,19 +849,8 @@ async function processMessage(chatId, messageText) {
   }
 
   // Step 3: Send response (no queries needed)
-  // Safety net: if AI says "no items" but this looks like a data query, fetch directly
-  const looksLikeDataQuery = /show|list|give|get|how many|who|which|find|search|tasks?|clients?|leads?|artists?|staff|team|assigned|available|status|breakdown/i.test(messageText);
-  if (looksLikeDataQuery && (!aiResponse.needs_data || aiResponse.queries.length === 0)) {
-    logger.info('Data query detected but AI returned no queries — forcing fallback fetch');
-    const fallbackResults = await fallbackFetchAll(messageText);
-    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
-      const formattedMessage = formatReadResults(fallbackResults, messageText);
-      await sendTelegramMessage(chatId, formattedMessage);
-      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
-      return;
-    }
-  }
-
+  // FIX 6: Removed looksLikeDataQuery fallback to prevent dual code paths
+  // Trust Gemini's response - if it didn't generate queries, send its message
   await sendTelegramMessage(chatId, aiResponse.message);
 
   logAudit({
@@ -1022,12 +1007,15 @@ function formatReadResults(results, originalRequest) {
   }
 
   let items = [];
+  let boardName = '';
+  
   for (const result of results) {
     if (!result || result.error) continue;
 
     // Handle boards query format
     if (result.boards) {
       for (const board of result.boards) {
+        if (!boardName && board.name) boardName = board.name;
         const boardItems = board.items_page?.items || board.items || [];
         items = items.concat(boardItems);
       }
@@ -1059,7 +1047,6 @@ function formatReadResults(results, originalRequest) {
   if (statusFilter) {
     const filtered = items.filter(item => {
       const columns = item.column_values || [];
-      // Get all status/color column texts (these are the label columns like Pipeline Stage, Availability, etc.)
       const statusTexts = columns
         .filter(col => col.text && (col.id.startsWith('color') || col.id.startsWith('status') ||
                 getColumnTitle(col.id).toLowerCase().includes('stage') ||
@@ -1068,11 +1055,9 @@ function formatReadResults(results, originalRequest) {
         .map(col => col.text.toLowerCase());
 
       if (statusFilter.exclude) {
-        // Item passes if NONE of its status columns match the excluded values
         return !statusTexts.some(text => statusFilter.exclude.some(s => text === s.toLowerCase()));
       }
       if (statusFilter.include) {
-        // Item passes if ANY of its status columns match the included values
         return statusTexts.some(text => statusFilter.include.some(s => text === s.toLowerCase()));
       }
       return true;
@@ -1082,23 +1067,44 @@ function formatReadResults(results, originalRequest) {
     }
   }
 
-  // Check if this is a "tasks" query
   const isTasksQuery = /tasks?|working on|assigned to/i.test(originalRequest);
 
-  // If too many items, paginate
-  if (items.length > 10) {
-    const summary = `Found ${items.length} items. Showing first 10:\n\n`;
-    const formatted = items.slice(0, 10).map((item, idx) => {
-      return formatSingleItem(item, idx + 1, isTasksQuery);
-    }).join('\n\n');
-    return summary + formatted + `\n\nType "next" for more or filter by status.`;
+  // FIX 5: Enforce 10-item pagination BEFORE formatting with clear header
+  const totalCount = items.length;
+  const itemsToShow = items.slice(0, 10);
+  
+  // FIX 3: Build as array of strings, then chunk at item boundaries for Telegram's 4096 limit
+  const itemStrings = itemsToShow.map((item, idx) => formatSingleItem(item, idx + 1, isTasksQuery));
+  
+  // FIX 1: Generate count header post-data, never from Gemini
+  let header = '';
+  if (totalCount > 10) {
+    header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found. Showing 1-10 — reply 'next' for more.\n\n`;
+  } else if (personName) {
+    header = `Found ${totalCount} result${totalCount > 1 ? 's' : ''} for "${personName}":\n\n`;
+  } else {
+    header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found:\n\n`;
   }
 
-  // Format all items
-  const header = personName ? `Found ${items.length} result${items.length > 1 ? 's' : ''} for "${personName}":\n\n` : '';
-  return header + items.map((item, idx) => {
-    return formatSingleItem(item, idx + 1, isTasksQuery);
-  }).join('\n\n');
+  // Chunk messages at item boundaries (max 3800 chars per message)
+  const chunks = [];
+  let currentChunk = header;
+  
+  for (const itemStr of itemStrings) {
+    if ((currentChunk + itemStr + '\n\n').length > 3800) {
+      chunks.push(currentChunk.trim());
+      currentChunk = itemStr + '\n\n';
+    } else {
+      currentChunk += itemStr + '\n\n';
+    }
+  }
+  
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
+  }
+
+  // Return first chunk (for now, multi-chunk support can be added later)
+  return chunks[0] || 'No data to display.';
 }
 
 // Helper to get column title from ID
@@ -1148,7 +1154,9 @@ function formatSingleItem(item, index, isTasksQuery) {
     });
 
     if (tasksCol && tasksCol.text && tasksCol.text.trim()) {
-      return `${index}. ${name}\n   Tasks: ${tasksCol.text}`;
+      // FIX 2: Truncate long text at 80 characters
+      const taskText = tasksCol.text.length > 80 ? tasksCol.text.substring(0, 77) + '...' : tasksCol.text;
+      return `${index}. ${name}\n   Tasks: ${taskText}`;
     } else {
       return `${index}. ${name}\n   No tasks assigned`;
     }
@@ -1166,7 +1174,9 @@ function formatSingleItem(item, index, isTasksQuery) {
     .slice(0, 5) // Limit to 5 most relevant columns
     .map(col => {
       const colTitle = getColumnTitle(col.id);
-      return `${colTitle}: ${col.text}`;
+      // FIX 2: Truncate long text at 80 characters
+      const colText = col.text.length > 80 ? col.text.substring(0, 77) + '...' : col.text;
+      return `${colTitle}: ${colText}`;
     })
     .join(' | ');
 
