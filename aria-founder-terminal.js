@@ -381,6 +381,10 @@ STAFF DATABASE (${TB}):
 "deactivate [name]"                    → SEARCH → UPDATE Status "Inactive"
 "assign [name] to sales"              → SEARCH → UPDATE Assigned Pipeline "Sales"
 "team overview"                        → GET ALL → count by Status + Access Level
+"tasks for [name]"                     → SEARCH for staff member → extract "Current Tasks/Projects" column
+"what is [name] working on"            → SEARCH for staff member → extract "Current Tasks/Projects" column
+"[name]'s tasks"                       → SEARCH for staff member → extract "Current Tasks/Projects" column
+"clients assigned to [name]"           → Search SALES board → filter by Assigned AE = [name]
 
 CROSS-BOARD:
 "full report" / "summary"             → Stats from all 3 boards
@@ -864,31 +868,66 @@ function formatReadResults(results, originalRequest) {
     return 'No items found.';
   }
 
+  // Check if this is a "tasks" query
+  const isTasksQuery = /tasks?|working on|assigned to/i.test(originalRequest);
+
   // If too many items, paginate
   if (items.length > 10) {
     const summary = `Found ${items.length} items. Showing first 10:\n\n`;
     const formatted = items.slice(0, 10).map((item, idx) => {
-      const name = item.name || 'Unnamed';
-      const columns = item.column_values || [];
-      const details = columns
-        .filter(col => col.text && col.text.trim() !== '')
-        .map(col => `${col.title}: ${col.text}`)
-        .join(' | ');
-      return `${idx + 1}. ${name}${details ? '\n   ' + details : ''}`;
+      return formatSingleItem(item, idx + 1, isTasksQuery);
     }).join('\n\n');
     return summary + formatted + `\n\nType "next" for more or filter by status.`;
   }
 
   // Format all items
   return items.map((item, idx) => {
-    const name = item.name || 'Unnamed';
-    const columns = item.column_values || [];
-    const details = columns
-      .filter(col => col.text && col.text.trim() !== '')
-      .map(col => `${col.title}: ${col.text}`)
-      .join(' | ');
-    return `${idx + 1}. ${name}${details ? '\n   ' + details : ''}`;
+    return formatSingleItem(item, idx + 1, isTasksQuery);
   }).join('\n\n');
+}
+
+// Format a single item with smart column selection
+function formatSingleItem(item, index, isTasksQuery) {
+  const name = item.name || 'Unnamed';
+  const columns = item.column_values || [];
+  
+  // Helper to get column title from ID
+  const getColumnTitle = (colId) => {
+    for (const boardKey of ['sales', 'artists', 'staff']) {
+      const boardCols = boardColumns[boardKey];
+      if (boardCols) {
+        const col = boardCols.find(c => c.id === colId);
+        if (col) return col.title;
+      }
+    }
+    return colId.replace(/_/g, ' ').replace(/mm1r\w+/g, '').trim() || colId;
+  };
+  
+  // For tasks queries, prioritize the "Current Tasks/Projects" column
+  if (isTasksQuery) {
+    const tasksCol = columns.find(col => {
+      const title = getColumnTitle(col.id).toLowerCase();
+      return title.includes('task') || title.includes('project') || title.includes('working');
+    });
+    
+    if (tasksCol && tasksCol.text && tasksCol.text.trim()) {
+      return `${index}. ${name}\n   Tasks: ${tasksCol.text}`;
+    } else {
+      return `${index}. ${name}\n   No tasks assigned`;
+    }
+  }
+  
+  // For general queries, show relevant non-empty columns
+  const details = columns
+    .filter(col => col.text && col.text.trim() !== '' && col.id !== 'name')
+    .slice(0, 5) // Limit to 5 most relevant columns
+    .map(col => {
+      const colTitle = getColumnTitle(col.id);
+      return `${colTitle}: ${col.text}`;
+    })
+    .join(' | ');
+  
+  return `${index}. ${name}${details ? '\n   ' + details : ''}`;
 }
 
 // Extract item IDs from Monday.com query results
