@@ -53,8 +53,8 @@ const CONFIG = {
     apiBase: 'https://api.monday.com/v2',
     boards: {
       sales: {
-        id: process.env.MONDAY_SALES_BOARD_ID || '5027403736',
-        name: 'Denicx Sales Pipeline',
+        id: process.env.MONDAY_SALES_BOARD_ID || '5027332893',
+        name: 'Client Database',
         type: 'sales'
       },
       artists: {
@@ -159,19 +159,15 @@ THREE-BOARD ARCHITECTURE — COMPLETE COLUMN SCHEMA
 
 You manage 3 Monday.com boards. The column_id values below are loaded directly from Monday.com at startup. Use them EXACTLY in all mutations.
 
-━━━ BOARD 1: SALES PIPELINE ━━━ Board ID: ${SB}
-Purpose: Client inquiries, deals, revenue pipeline
+━━━ BOARD 1: CLIENT DATABASE (Sales/Leads) ━━━ Board ID: ${SB}
+Purpose: Client inquiries, leads, talent applications — all incoming contacts
 Default Group: "topics"
-Stages: New Inquiry → Contacted → Qualified → Proposal Sent → Deal Won → Deal Lost
 
 COLUMNS (use these exact column_id values):
-   - "name" → Item Name (the lead/client name)
+   - "name" → Client/Lead Name
 ${formatColumnsForPrompt('sales')}
 
-STATUS LABEL OPTIONS for Sales:
-   Source Channel: "WhatsApp" | "Email" | "Manual"
-   Pipeline Stage: "New Inquiry" | "Contacted" | "Qualified" | "Proposal Sent" | "Deal Won" | "Deal Lost"
-   AI Intent: "inquiry" | "complaint" | "order" | "followup" | "unknown"
+Note: Column IDs are loaded dynamically at startup. The board has columns for Phone, Source, Assigned AE, Message/Role, and Last action taken. Use the exact column_ids shown above.
 
 ━━━ BOARD 2: ARTIST DATABASE ━━━ Board ID: ${AB}
 Purpose: Talent roster, applications, bookings, contracts
@@ -225,14 +221,14 @@ The system executes queries in order. Queries containing ITEM_ID_PLACEHOLDER are
 
 PATTERN — Search + Update Status:
 queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"nikhil\\"], operator: contains_text}]}) { items { id name column_values { id text title } } } } }",
+  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"nikhil\\"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }",
   "mutation { change_multiple_column_values(board_id: ${SB}, item_id: ITEM_ID_PLACEHOLDER, column_values: \\"{\\\\\\"PIPELINE_STAGE_COL_ID\\\\\\":{\\\\\\"label\\\\\\":\\\\\\"Qualified\\\\\\"}}\\" ) { id name } }"
 ]
 IMPORTANT: Replace PIPELINE_STAGE_COL_ID with the actual column_id for Pipeline Stage from the COLUMNS list above (it will be something like "color_mm16g2da" or "status_3" etc).
 
 PATTERN — Search + Clear a text/status field:
 queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"aisha\\"], operator: contains_text}]}) { items { id name column_values { id text title } } } } }",
+  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"aisha\\"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }",
   "mutation { change_multiple_column_values(board_id: ${SB}, item_id: ITEM_ID_PLACEHOLDER, column_values: \\"{\\\\\\"ASSIGNED_AE_COL_ID\\\\\\":\\\\\\"\\\\\\"}\\" ) { id name } }"
 ]
 IMPORTANT: Replace ASSIGNED_AE_COL_ID with the actual column_id from the COLUMNS list above.
@@ -269,16 +265,16 @@ GRAPHQL REFERENCE — COMPLETE OPERATIONS
 ── READ ──────────────────────────────────────────────────────
 
 SEARCH BY NAME:
-query { boards(ids: [BOARD_ID]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["TERM"], operator: contains_text}]}) { items { id name column_values { id text title value } } } } }
+query { boards(ids: [BOARD_ID]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["TERM"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }
 
 GET ALL ITEMS:
-query { boards(ids: [BOARD_ID]) { items_page(limit: 100) { items { id name column_values { id text title value } created_at } } } }
+query { boards(ids: [BOARD_ID]) { items_page(limit: 100) { items { id name column_values { id text value type } created_at } } } }
 
 GET RECENT ITEMS:
-query { boards(ids: [BOARD_ID]) { items_page(limit: 10, query_params: {order_by: [{column_id: "creation_log__1", direction: desc}]}) { items { id name column_values { id text title } created_at } } } }
+query { boards(ids: [BOARD_ID]) { items_page(limit: 10, query_params: {order_by: [{column_id: "creation_log__1", direction: desc}]}) { items { id name column_values { id text value type } created_at } } } }
 
 GET ITEM WITH NOTES:
-query { items(ids: [ITEM_ID]) { id name column_values { id text title value } updates(limit: 10) { id body created_at creator { name } } created_at } }
+query { items(ids: [ITEM_ID]) { id name column_values { id text value type } updates(limit: 10) { id body created_at creator { name } } created_at } }
 
 BOARD STATS:
 query { boards(ids: [BOARD_ID]) { name items_count columns { id title type } groups { id title } } }
@@ -556,6 +552,17 @@ async function callGemini(userMessage, dataContext = null, retryCount = 0) {
 
     // Normalize response format (handle old field names from Gemini)
     result = normalizeAIResponse(result);
+
+    // Sanitize message — strip any leaked JSON fragments
+    if (result.message) {
+      result.message = result.message
+        .replace(/","needs_data".*$/s, '')
+        .replace(/","queries".*$/s, '')
+        .replace(/","action_type".*$/s, '')
+        .replace(/","follow_up".*$/s, '')
+        .replace(/\{"message":\s*"/g, '')
+        .trim();
+    }
 
     // Add to history
     conversationHistory.push({
