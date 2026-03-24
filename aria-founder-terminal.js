@@ -76,7 +76,11 @@ const CONFIG = {
 // ============================================================
 
 const CONVERSATION_FILE = path.join(DATA_DIR, 'conversation.json');
-const MAX_HISTORY = 20; // Increased for better context
+const MAX_HISTORY = 6; // Reduced to minimize API payload and rate limits
+
+// Request throttling to prevent rapid successive API calls
+let lastGeminiCall = 0;
+const MIN_CALL_INTERVAL = 2000; // 2 seconds between calls
 
 function loadConversation() {
   try {
@@ -508,6 +512,16 @@ function normalizeAIResponse(raw) {
 async function callGemini(userMessage, dataContext = null, retryCount = 0) {
   const MAX_RETRIES = 3;
 
+  // Throttle requests to prevent rapid successive calls
+  const now = Date.now();
+  const timeSinceLastCall = now - lastGeminiCall;
+  if (timeSinceLastCall < MIN_CALL_INTERVAL) {
+    const waitTime = MIN_CALL_INTERVAL - timeSinceLastCall;
+    logger.info(`Throttling Gemini call, waiting ${waitTime}ms`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+  lastGeminiCall = Date.now();
+
   // Build message with context
   let fullMessage = userMessage;
   if (dataContext) {
@@ -596,7 +610,7 @@ async function callGemini(userMessage, dataContext = null, retryCount = 0) {
   } catch (error) {
     // Retry on rate limit (429) with exponential backoff
     if (error.response?.status === 429 && retryCount < MAX_RETRIES) {
-      const retryAfter = Math.min((retryCount + 1) * 5000, 20000); // 5s, 10s, 15s
+      const retryAfter = Math.min((retryCount + 1) * 10000, 60000); // 10s, 20s, 30s, max 60s
       logger.warn(`Gemini rate limited (429), retry ${retryCount + 1}/${MAX_RETRIES} in ${retryAfter / 1000}s`);
       await new Promise(resolve => setTimeout(resolve, retryAfter));
       return callGemini(userMessage, dataContext, retryCount + 1);
@@ -612,7 +626,7 @@ async function callGemini(userMessage, dataContext = null, retryCount = 0) {
     // Specific message for rate limits that exhausted retries
     if (error.response?.status === 429) {
       return {
-        message: "I'm temporarily rate-limited by Google's API. Please wait 30 seconds and try again.",
+        message: "I'm temporarily rate-limited by Google's API. Please wait 60 seconds and try again.",
         needs_data: false,
         queries: [],
         action_type: 'error',
@@ -785,17 +799,19 @@ async function processMessage(chatId, messageText) {
       }
     }
 
-    // Pass results back to AI for ALL action types that have data
-    // This ensures the AI can format reads, confirm writes, and answer questions with data
-    await sendTypingIndicator(chatId);
-    const contextMessage = aiResponse.action_type === 'read'
-      ? 'Format this data clearly for Sourabh.'
-      : aiResponse.action_type === 'write'
-      ? `The following mutations were executed. Confirm the results to Sourabh concisely.\n\nOriginal request: "${messageText}"`
-      : `Here is the data from Monday.com. Use it to answer Sourabh's question or take the next action.\n\nOriginal request: "${messageText}"`;
-
-    const refinedResponse = await callGemini(contextMessage, allResults);
-    await sendTelegramMessage(chatId, refinedResponse.message);
+    // For READ operations: format data directly without second Gemini call
+    // For WRITE operations: make second call to confirm execution
+    if (aiResponse.action_type === 'read') {
+      // Format read results directly
+      const formattedMessage = formatReadResults(allResults, messageText);
+      await sendTelegramMessage(chatId, formattedMessage);
+    } else {
+      // For writes, confirm with AI
+      await sendTypingIndicator(chatId);
+      const contextMessage = `The following mutations were executed. Confirm the results to Sourabh concisely.\n\nOriginal request: "${messageText}"`;
+      const refinedResponse = await callGemini(contextMessage, allResults);
+      await sendTelegramMessage(chatId, refinedResponse.message);
+    }
 
     // Clear cache on writes
     if (aiResponse.action_type === 'write') {
@@ -818,6 +834,61 @@ async function processMessage(chatId, messageText) {
     message: messageText,
     queriesExecuted: 0,
   });
+}
+
+// Format read results without calling Gemini again
+function formatReadResults(results, originalRequest) {
+  if (!results || results.length === 0) {
+    return 'No data found.';
+  }
+
+  let items = [];
+  for (const result of results) {
+    if (!result || result.error) continue;
+    
+    // Handle boards query format
+    if (result.boards) {
+      for (const board of result.boards) {
+        const boardItems = board.items_page?.items || board.items || [];
+        items = items.concat(boardItems);
+      }
+    }
+    
+    // Handle direct items query format
+    if (result.items) {
+      items = items.concat(result.items);
+    }
+  }
+
+  if (items.length === 0) {
+    return 'No items found.';
+  }
+
+  // If too many items, paginate
+  if (items.length > 10) {
+    const summary = `Found ${items.length} items. Showing first 10:\n\n`;
+    const formatted = items.slice(0, 10).map((item, idx) => {
+      const name = item.name || 'Unnamed';
+      const columns = item.column_values || [];
+      const details = columns
+        .filter(col => col.text && col.text.trim() !== '')
+        .map(col => `${col.title}: ${col.text}`)
+        .join(' | ');
+      return `${idx + 1}. ${name}${details ? '\n   ' + details : ''}`;
+    }).join('\n\n');
+    return summary + formatted + `\n\nType "next" for more or filter by status.`;
+  }
+
+  // Format all items
+  return items.map((item, idx) => {
+    const name = item.name || 'Unnamed';
+    const columns = item.column_values || [];
+    const details = columns
+      .filter(col => col.text && col.text.trim() !== '')
+      .map(col => `${col.title}: ${col.text}`)
+      .join(' | ');
+    return `${idx + 1}. ${name}${details ? '\n   ' + details : ''}`;
+  }).join('\n\n');
 }
 
 // Extract item IDs from Monday.com query results
