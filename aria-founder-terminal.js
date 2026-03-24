@@ -490,24 +490,28 @@ function normalizeAIResponse(raw) {
   };
 }
 
-async function callGemini(userMessage, dataContext = null) {
+async function callGemini(userMessage, dataContext = null, retryCount = 0) {
+  const MAX_RETRIES = 3;
+
   // Build message with context
   let fullMessage = userMessage;
   if (dataContext) {
     fullMessage += `\n\n[DATA FROM MONDAY.COM]:\n${JSON.stringify(dataContext, null, 2)}`;
   }
-  
-  // Add to history
-  conversationHistory.push({
-    role: 'user',
-    parts: [{ text: fullMessage }]
-  });
-  
-  // Keep history manageable
-  while (conversationHistory.length > MAX_HISTORY) {
-    conversationHistory.shift();
+
+  // Only add to history on first attempt (not retries)
+  if (retryCount === 0) {
+    conversationHistory.push({
+      role: 'user',
+      parts: [{ text: fullMessage }]
+    });
+
+    // Keep history manageable
+    while (conversationHistory.length > MAX_HISTORY) {
+      conversationHistory.shift();
+    }
   }
-  
+
   try {
     const response = await axios.post(
       `${CONFIG.gemini.apiBase}/models/${CONFIG.gemini.model}:generateContent?key=${CONFIG.gemini.apiKey}`,
@@ -517,7 +521,7 @@ async function callGemini(userMessage, dataContext = null) {
         },
         contents: conversationHistory,
         generationConfig: {
-          temperature: 0.3, // Low for deterministic execution
+          temperature: 0.3,
           topP: 0.95,
           topK: 40,
           maxOutputTokens: 2048,
@@ -525,13 +529,13 @@ async function callGemini(userMessage, dataContext = null) {
       },
       { timeout: 30000 }
     );
-    
+
     const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    
+
     if (!text) {
       throw new Error('No response from Gemini');
     }
-    
+
     // Parse JSON response
     let result;
     try {
@@ -552,21 +556,44 @@ async function callGemini(userMessage, dataContext = null) {
 
     // Normalize response format (handle old field names from Gemini)
     result = normalizeAIResponse(result);
-    
+
     // Add to history
     conversationHistory.push({
       role: 'model',
       parts: [{ text: JSON.stringify(result) }]
     });
-    
+
     saveConversation(conversationHistory);
-    
+
     return result;
-    
+
   } catch (error) {
-    logger.error('Gemini API error', { error: error.message, response: error.response?.data });
-    
-    // Production-grade error handling
+    // Retry on rate limit (429) with exponential backoff
+    if (error.response?.status === 429 && retryCount < MAX_RETRIES) {
+      const retryAfter = Math.min((retryCount + 1) * 5000, 20000); // 5s, 10s, 15s
+      logger.warn(`Gemini rate limited (429), retry ${retryCount + 1}/${MAX_RETRIES} in ${retryAfter / 1000}s`);
+      await new Promise(resolve => setTimeout(resolve, retryAfter));
+      return callGemini(userMessage, dataContext, retryCount + 1);
+    }
+
+    logger.error('Gemini API error', {
+      error: error.message,
+      status: error.response?.status,
+      data: error.response?.data?.error?.message?.substring(0, 200),
+      retry: retryCount,
+    });
+
+    // Specific message for rate limits that exhausted retries
+    if (error.response?.status === 429) {
+      return {
+        message: "I'm temporarily rate-limited by Google's API. Please wait 30 seconds and try again.",
+        needs_data: false,
+        queries: [],
+        action_type: 'error',
+        follow_up: ''
+      };
+    }
+
     return {
       message: "I'm having trouble processing that right now. Can you rephrase or try again?",
       needs_data: false,
