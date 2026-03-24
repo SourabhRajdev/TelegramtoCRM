@@ -153,9 +153,10 @@ IRON RULES — BREAK THESE AND YOU FAIL
 2. ONE QUESTION MAX: If truly ambiguous (multiple name matches, unclear board, missing critical data), ask exactly ONE clarifying question with a search query attached. Then execute on his answer.
 3. CONFIRM = GO: "yes" / "good" / "ok" / "do it" / "go" / "sure" / "yep" / "perfect" → Execute the pending action NOW with real queries.
 4. NO FLUFF: Never say "Sure!", "Great!", "Of course!", "Understood!", or rephrase the request back. State what you're doing or what the data shows.
-5. NO EMPTY HANDS: Every "read" or "write" response MUST contain executable GraphQL in the queries array. No exceptions.
+5. NO EMPTY HANDS: Every "read" or "write" response MUST contain executable GraphQL in the queries array. No exceptions. NEVER return needs_data: false for data queries.
 6. NO FAKE QUERIES: Never use placeholder text like "SEARCH_QUERY", "MUTATION_HERE", or "COLUMN_ID". Use real board IDs, real column_ids from the schema below, and real GraphQL syntax.
-7. NO EXCUSES: Never say "I cannot", "I'm unable", or "error". Find a way or state precisely what's missing.
+7. NO EXCUSES: Never say "I cannot", "I'm unable", "No items found", or "error" WITHOUT first executing a query. ALWAYS query Monday.com before saying data doesn't exist.
+8. QUERY FIRST, ANSWER SECOND: For ANY question about data (show, list, find, how many, which, what, who, available, charge, price, status) → ALWAYS set needs_data: true and generate queries[]. NEVER guess or say "no data" without querying.
 
 ═══════════════════════════════════════════════════════════════
 THREE-BOARD ARCHITECTURE — COMPLETE COLUMN SCHEMA
@@ -783,6 +784,19 @@ async function processMessage(chatId, messageText) {
   // Step 1: Get AI response
   const aiResponse = await callGemini(messageText);
 
+  // SAFETY NET: If Gemini failed to generate queries for obvious data requests, force a fallback
+  const isDataRequest = /show|list|give|get|fetch|how many|how much|which|what|who|find|search|available|charge|price|pricing|status|tasks?|clients?|leads?|artists?|staff|team|assigned|breakdown/i.test(messageText);
+  if (isDataRequest && (!aiResponse.needs_data || !aiResponse.queries || aiResponse.queries.length === 0)) {
+    logger.warn('Gemini failed to generate queries for data request, forcing fallback', { message: messageText });
+    const fallbackResults = await fallbackFetchAll(messageText);
+    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
+      const formattedMessage = formatReadResults(fallbackResults, messageText);
+      await sendTelegramMessage(chatId, formattedMessage);
+      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
+      return;
+    }
+  }
+
   // Step 2: Execute queries if needed
   if (aiResponse.needs_data && aiResponse.queries && aiResponse.queries.length > 0) {
     // Separate queries into phases: first execute lookups, then use results for mutations
@@ -984,6 +998,49 @@ function extractStatusFilter(query) {
   return null;
 }
 
+// Extract numeric filter from natural language query
+function extractNumericFilter(query) {
+  const q = query.toLowerCase();
+  
+  // "experience years more than or equal to 8"
+  // "experience >= 8"
+  // "more than 5 years"
+  // "at least 10 years"
+  const patterns = [
+    /experience.*?(?:more than|greater than|>=|>)\s*(?:or\s+equal\s+to\s+)?(\d+)/i,
+    /experience.*?(?:at least|minimum)\s+(\d+)/i,
+    /(\d+)\+?\s*years?\s+(?:of\s+)?experience/i,
+    /experience.*?(\d+)\s*(?:years?)?\s*(?:or more|and above|\+)/i,
+  ];
+  
+  for (const pattern of patterns) {
+    const match = q.match(pattern);
+    if (match) {
+      return { field: 'experience', operator: '>=', value: parseInt(match[1]) };
+    }
+  }
+  
+  // "less than 5 years"
+  const lessThanMatch = q.match(/experience.*?(?:less than|<)\s*(\d+)/i);
+  if (lessThanMatch) {
+    return { field: 'experience', operator: '<', value: parseInt(lessThanMatch[1]) };
+  }
+  
+  // "pricing under 3000" / "price less than 5000"
+  const priceLessMatch = q.match(/(?:pricing|price|charge).*?(?:under|less than|below|<)\s*(\d+)/i);
+  if (priceLessMatch) {
+    return { field: 'pricing', operator: '<', value: parseInt(priceLessMatch[1]) };
+  }
+  
+  // "pricing over 5000" / "price more than 3000"
+  const priceMoreMatch = q.match(/(?:pricing|price|charge).*?(?:over|more than|above|>)\s*(\d+)/i);
+  if (priceMoreMatch) {
+    return { field: 'pricing', operator: '>', value: parseInt(priceMoreMatch[1]) };
+  }
+  
+  return null;
+}
+
 // Check if an item matches a person name (search across all text column values)
 function itemMatchesPerson(item, personName) {
   if (!personName) return true;
@@ -1039,6 +1096,52 @@ function formatReadResults(results, originalRequest) {
       items = filtered;
     } else {
       return `No items found matching "${personName}". Check the spelling or try a different name.`;
+    }
+  }
+
+  // Apply numeric filter (experience, pricing, etc.)
+  const numericFilter = extractNumericFilter(originalRequest);
+  if (numericFilter) {
+    const filtered = items.filter(item => {
+      const columns = item.column_values || [];
+      
+      // Find the relevant column based on filter field
+      let targetCol = null;
+      if (numericFilter.field === 'experience') {
+        targetCol = columns.find(col => {
+          const title = getColumnTitle(col.id).toLowerCase();
+          return title.includes('experience') || title.includes('years');
+        });
+      } else if (numericFilter.field === 'pricing') {
+        targetCol = columns.find(col => {
+          const title = getColumnTitle(col.id).toLowerCase();
+          return title.includes('pricing') || title.includes('price') || title.includes('charge');
+        });
+      }
+      
+      if (!targetCol || !targetCol.text) return false;
+      
+      // Extract numeric value from text
+      const numMatch = targetCol.text.match(/(\d+)/);
+      if (!numMatch) return false;
+      
+      const itemValue = parseInt(numMatch[1]);
+      
+      // Apply operator
+      switch (numericFilter.operator) {
+        case '>=': return itemValue >= numericFilter.value;
+        case '>': return itemValue > numericFilter.value;
+        case '<': return itemValue < numericFilter.value;
+        case '<=': return itemValue <= numericFilter.value;
+        case '=': return itemValue === numericFilter.value;
+        default: return true;
+      }
+    });
+    
+    if (filtered.length > 0) {
+      items = filtered;
+    } else {
+      return `No items found matching the filter: ${numericFilter.field} ${numericFilter.operator} ${numericFilter.value}`;
     }
   }
 
