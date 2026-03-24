@@ -40,7 +40,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const CONFIG = {
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
-    founderChatId: process.env.TELEGRAM_FOUNDER_CHAT_ID,
+    allowedChatIds: (process.env.TELEGRAM_ALLOWED_CHAT_IDS || process.env.TELEGRAM_FOUNDER_CHAT_ID || '').split(',').map(id => id.trim()).filter(Boolean),
     apiBase: 'https://api.telegram.org',
   },
   gemini: {
@@ -858,7 +858,7 @@ async function processMessage(chatId, messageText) {
   logger.info('Message received', { chatId, message: messageText });
 
   // Security check
-  if (CONFIG.telegram.founderChatId && chatId.toString() !== CONFIG.telegram.founderChatId.toString()) {
+  if (CONFIG.telegram.allowedChatIds.length > 0 && !CONFIG.telegram.allowedChatIds.includes(chatId.toString())) {
     logger.warn('Unauthorized access', { chatId });
     await sendTelegramMessage(chatId, 'Unauthorized access.');
     return;
