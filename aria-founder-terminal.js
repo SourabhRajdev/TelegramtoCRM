@@ -202,6 +202,12 @@ STATUS LABEL OPTIONS for Staff:
    Assigned Pipeline: "Sales" | "Artist Management" | "Staff Hiring" | "All Pipelines"
    Status: "Active" | "Inactive" | "On Leave"
 
+⚠️ CRITICAL — STAFF BOARD ITEM NAMES ARE CODES (STF-001, STF-002, etc.), NOT PERSON NAMES.
+To find a staff member by person name, you MUST fetch ALL items and the system will filter locally:
+  query { boards(ids: [${TB}]) { items_page(limit: 50) { items { id name column_values { id text value type } } } } }
+The person's identity is in their email column (e.g. sourabh@denicx.com, yash@denicx.com).
+NEVER search staff by name column with contains_text — it will always return 0 results.
+
 ═══════════════════════════════════════════════════════════════
 BOARD ROUTING — AUTOMATIC DETECTION
 ═══════════════════════════════════════════════════════════════
@@ -376,15 +382,15 @@ STAFF DATABASE (${TB}):
 "show team" / "show staff"             → GET ALL ITEMS
 "active staff"                         → GET ALL → filter Status = Active
 "add staff [name]"                     → CREATE ITEM
-"promote [name] to manager"            → SEARCH → UPDATE Access Level "Manager"
-"put [name] on leave"                  → SEARCH → UPDATE Status "On Leave"
-"deactivate [name]"                    → SEARCH → UPDATE Status "Inactive"
-"assign [name] to sales"              → SEARCH → UPDATE Assigned Pipeline "Sales"
+"promote [name] to manager"            → GET ALL staff → system finds ID → UPDATE Access Level "Manager"
+"put [name] on leave"                  → GET ALL staff → system finds ID → UPDATE Status "On Leave"
+"deactivate [name]"                    → GET ALL staff → system finds ID → UPDATE Status "Inactive"
+"assign [name] to sales"              → GET ALL staff → system finds ID → UPDATE Assigned Pipeline "Sales"
 "team overview"                        → GET ALL → count by Status + Access Level
-"tasks for [name]"                     → SEARCH for staff member → extract "Current Tasks/Projects" column
-"what is [name] working on"            → SEARCH for staff member → extract "Current Tasks/Projects" column
-"[name]'s tasks"                       → SEARCH for staff member → extract "Current Tasks/Projects" column
-"clients assigned to [name]"           → Search SALES board → filter by Assigned AE = [name]
+"tasks for [name]"                     → GET ALL staff items (system filters by person name in column values)
+"what is [name] working on"            → GET ALL staff items (system filters by person name)
+"[name]'s tasks"                       → GET ALL staff items (system filters by person name)
+"clients assigned to [name]"           → GET ALL items from SALES board (system filters by Assigned AE column matching [name])
 
 CROSS-BOARD:
 "full report" / "summary"             → Stats from all 3 boards
@@ -840,6 +846,46 @@ async function processMessage(chatId, messageText) {
   });
 }
 
+// Extract person name from a natural language query
+function extractPersonName(query) {
+  const q = query.toLowerCase();
+  // Match patterns like "tasks for X", "assigned to X", "X's tasks", "clients of X"
+  const patterns = [
+    /(?:tasks?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
+    /(?:assigned\s+to)\s+(\w+)/i,
+    /(?:clients?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
+    /(\w+)['']s\s+(?:tasks?|clients?|work)/i,
+    /(?:give\s+me\s+the\s+\w+\s+(?:listed|assigned)\s+(?:for|to))\s+(\w+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = q.match(pattern);
+    if (match && match[1]) {
+      const name = match[1].toLowerCase();
+      // Exclude common words that aren't names
+      if (!['the', 'all', 'my', 'our', 'me', 'any', 'each', 'every'].includes(name)) {
+        return name;
+      }
+    }
+  }
+  return null;
+}
+
+// Check if an item matches a person name (search across all text column values)
+function itemMatchesPerson(item, personName) {
+  if (!personName) return true;
+  const name = personName.toLowerCase();
+
+  // Check item name
+  if (item.name && item.name.toLowerCase().includes(name)) return true;
+
+  // Check all column values for the person name
+  const columns = item.column_values || [];
+  for (const col of columns) {
+    if (col.text && col.text.toLowerCase().includes(name)) return true;
+  }
+  return false;
+}
+
 // Format read results without calling Gemini again
 function formatReadResults(results, originalRequest) {
   if (!results || results.length === 0) {
@@ -849,7 +895,7 @@ function formatReadResults(results, originalRequest) {
   let items = [];
   for (const result of results) {
     if (!result || result.error) continue;
-    
+
     // Handle boards query format
     if (result.boards) {
       for (const board of result.boards) {
@@ -857,7 +903,7 @@ function formatReadResults(results, originalRequest) {
         items = items.concat(boardItems);
       }
     }
-    
+
     // Handle direct items query format
     if (result.items) {
       items = items.concat(result.items);
@@ -866,6 +912,17 @@ function formatReadResults(results, originalRequest) {
 
   if (items.length === 0) {
     return 'No items found.';
+  }
+
+  // Check if this is a person-specific query and filter locally
+  const personName = extractPersonName(originalRequest);
+  if (personName) {
+    const filtered = items.filter(item => itemMatchesPerson(item, personName));
+    if (filtered.length > 0) {
+      items = filtered;
+    } else {
+      return `No items found matching "${personName}". Check the spelling or try a different name.`;
+    }
   }
 
   // Check if this is a "tasks" query
@@ -881,7 +938,8 @@ function formatReadResults(results, originalRequest) {
   }
 
   // Format all items
-  return items.map((item, idx) => {
+  const header = personName ? `Found ${items.length} result${items.length > 1 ? 's' : ''} for "${personName}":\n\n` : '';
+  return header + items.map((item, idx) => {
     return formatSingleItem(item, idx + 1, isTasksQuery);
   }).join('\n\n');
 }
