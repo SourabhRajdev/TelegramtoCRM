@@ -1154,9 +1154,15 @@ function formatSingleItem(item, index, isTasksQuery) {
     }
   }
 
-  // For general queries, show relevant non-empty columns
+  // For general queries, show relevant non-empty columns (excluding Name column)
   const details = columns
-    .filter(col => col.text && col.text.trim() !== '' && col.id !== 'name')
+    .filter(col => {
+      if (!col.text || col.text.trim() === '' || col.id === 'name') return false;
+      const title = getColumnTitle(col.id).toLowerCase();
+      // Skip "Name" column by title as well
+      if (title === 'name' || title === 'full name' || title === 'item name') return false;
+      return true;
+    })
     .slice(0, 5) // Limit to 5 most relevant columns
     .map(col => {
       const colTitle = getColumnTitle(col.id);
