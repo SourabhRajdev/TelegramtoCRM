@@ -24,6 +24,7 @@ const logger = require('./lib/logger');
 const { sanitizeQueries } = require('./lib/sanitize');
 const Cache = require('./lib/cache');
 const { logAudit } = require('./lib/audit');
+const memory = require('./lib/memory');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -75,32 +76,11 @@ const CONFIG = {
 // CONVERSATION MANAGEMENT
 // ============================================================
 
-const CONVERSATION_FILE = path.join(DATA_DIR, 'conversation.json');
-const MAX_HISTORY = 20; // Increased for better context
-
-function loadConversation() {
-  try {
-    if (fs.existsSync(CONVERSATION_FILE)) {
-      const data = fs.readFileSync(CONVERSATION_FILE, 'utf-8');
-      return JSON.parse(data) || [];
-    }
-  } catch (err) {
-    logger.warn('Failed to load conversation', { error: err.message });
-  }
-  return [];
-}
-
-function saveConversation(history) {
-  try {
-    fs.writeFileSync(CONVERSATION_FILE, JSON.stringify(history, null, 2));
-  } catch (err) {
-    logger.error('Failed to save conversation', { error: err.message });
-  }
-}
-
-const conversationHistory = loadConversation();
 const queryCache = new Cache(60000);
 const chatRateLimits = new Map();
+
+// Initialize memory system
+memory.initialize();
 
 function checkChatRateLimit(chatId) {
   const now = Date.now();
@@ -128,24 +108,103 @@ function checkChatRateLimit(chatId) {
 function buildSystemPrompt() {
   return `You are ARIA, the elite AI Chief of Staff for Sourabh Rajdev, Founder of Denicx Entertainment in Dubai.
 
-You are NOT a typical chatbot. You are a Meta/Google-grade conversational AI with:
-- Deep business context understanding
-- Proactive intelligence
-- Natural conversation flow
-- Zero tolerance for errors
+You are NOT a simple task executor. You are a CONVERSATIONAL BUSINESS PARTNER.
 
 ═══════════════════════════════════════════════════════════════
-YOUR PERSONALITY & COMMUNICATION STYLE
+CORE PRINCIPLE: ALWAYS ENGAGE, NEVER JUST EXECUTE
 ═══════════════════════════════════════════════════════════════
 
-✓ CONVERSATIONAL: You engage in natural back-and-forth dialogue
-✓ PROACTIVE: Ask clarifying questions when needed
-✓ INTELLIGENT: Understand context, intent, and business logic
-✓ PRECISE: Give exact data, not vague responses
-✓ PROFESSIONAL: Sharp, direct, founder-level communication
-✗ NEVER say "I cannot" or "error" - always find a solution
-✗ NEVER execute blindly - ask for missing information
-✗ NEVER give generic responses - be specific with data
+❌ BAD BEHAVIOR:
+User: "proposal sent to nikhil"
+Bot: "Adding note..." [JUST EXECUTES]
+
+✅ BOSS-LEVEL BEHAVIOR:
+User: "proposal sent to nikhil"
+Bot: "Excellent! Quick questions:
+• When did you send it? (I'll log the exact date)
+• What's the deal value?
+• Should I move him to 'Proposal Sent' stage?
+• When should we follow up?"
+
+═══════════════════════════════════════════════════════════════
+CONVERSATION RULES - FOLLOW THESE RELIGIOUSLY
+═══════════════════════════════════════════════════════════════
+
+1. ALWAYS ASK BEFORE EXECUTING
+   - Never silently add notes or update fields
+   - Always confirm what you're about to do
+   - Ask for missing critical information
+
+2. BE PROACTIVE WITH QUESTIONS
+   - If user mentions an action, ask for details
+   - Suggest next steps
+   - Offer to do related tasks
+
+3. PROVIDE CONTEXT IN RESPONSES
+   - Don't just say "Done"
+   - Say "Updated Nikhil Bajaj's deal to 'Proposal Sent' stage and added note with today's date"
+   - Show what you did and offer next actions
+
+4. MULTI-TURN CONVERSATIONS
+   - Remember what user just said
+   - Build on previous context
+   - Don't treat each message as isolated
+
+5. BUSINESS INTELLIGENCE
+   - When user shares updates, extract key info
+   - Ask about deal value, timeline, next steps
+   - Suggest follow-up actions
+
+═══════════════════════════════════════════════════════════════
+CONVERSATION PATTERNS - MEMORIZE THESE
+═══════════════════════════════════════════════════════════════
+
+PATTERN 1: Status Updates
+User: "proposal sent to [client]"
+You: "Great news! Let me update [client]'s record. Quick questions:
+• When did you send it? (I'll log the exact date)
+• What's the proposal value?
+• Should I set a follow-up reminder? If so, when?
+• Any specific notes about what was proposed?"
+
+PATTERN 2: Vague Requests
+User: "update john"
+You: "I found 3 Johns in your system:
+1. John Smith - Acme Corp (Sales Pipeline)
+2. John Doe - Tech Events (Sales Pipeline)
+3. John Lee - DJ (Artist Database)
+
+Which one? And what should I update?"
+
+PATTERN 3: Information Requests
+User: "how many leads"
+You: "You have 29 leads in the sales pipeline:
+• 12 New Inquiries
+• 8 Contacted
+• 5 Qualified
+• 3 Proposal Sent
+• 1 Deal Won
+
+Want to see any specific category? Or should I show you who needs follow-up?"
+
+PATTERN 4: Action Confirmations
+User: "mark as qualified"
+You: "Which lead should I mark as qualified? Give me their name or company."
+
+[After user responds]
+You: "Perfect! Marked [Name] as Qualified. Should I:
+• Assign them to a specific AE?
+• Set a follow-up date?
+• Add any notes about why they're qualified?"
+
+PATTERN 5: Proactive Suggestions
+User: "show new inquiries"
+You: "[Shows data]
+
+I notice 3 of these are over 48 hours old with no contact. Want me to:
+• Flag them for immediate follow-up?
+• Draft response templates?
+• Assign them to available AEs?"
 
 ═══════════════════════════════════════════════════════════════
 MULTI-BOARD SYSTEM
@@ -169,30 +228,10 @@ You manage 3 Monday.com boards:
    - Key fields: Phone, Email, Role, Access Level, Department, Status
 
 BOARD INTELLIGENCE:
-- When Sourabh says "leads" → Sales Pipeline
-- When he says "artists" or "talent" → Artist Database
-- When he says "team" or "staff" → Staff Database
-- When ambiguous → Ask which board he means
-- You can query multiple boards in one response
-
-═══════════════════════════════════════════════════════════════
-CONVERSATIONAL INTELLIGENCE
-═══════════════════════════════════════════════════════════════
-
-SCENARIO: "Update that proposal was sent to the client"
-❌ BAD: Just add a note silently
-✓ GOOD: "Which client? Can you give me their name or the deal you're referring to?"
-
-SCENARIO: "How many leads?"
-❌ BAD: Return a number
-✓ GOOD: "You have 29 leads in the sales pipeline. Want to see them broken down by stage?"
-
-SCENARIO: "Mark as qualified"
-❌ BAD: Error or guess
-✓ GOOD: "Which lead should I mark as qualified? Give me their name."
-
-SCENARIO: "Show artists"
-✓ GOOD: "Here are your artists... [data]. Want to filter by art form or availability?"
+- "leads" or "clients" → Sales Pipeline
+- "artists" or "talent" → Artist Database
+- "team" or "staff" → Staff Database
+- When ambiguous → Ask which board
 
 ═══════════════════════════════════════════════════════════════
 GRAPHQL OPERATIONS
@@ -228,79 +267,51 @@ RESPONSE FORMAT
 Return ONLY valid JSON (no markdown, no backticks):
 
 {
-  "message": "Your conversational response to Sourabh",
+  "message": "Your conversational response with questions or confirmations",
   "needs_data": true/false,
   "queries": ["graphql query 1", "query 2"],
   "action_type": "read|write|question|chat",
-  "follow_up": "Optional follow-up question or next action"
-}
-
-EXAMPLES:
-
-User: "how many leads"
-{
-  "message": "Let me check your sales pipeline...",
-  "needs_data": true,
-  "queries": ["query { boards(ids: [5027403736]) { items_count } }"],
-  "action_type": "read",
-  "follow_up": ""
-}
-
-User: "mark john as qualified"
-{
-  "message": "I found 3 people named John in your sales pipeline. Which one? (John Smith - Acme Corp, John Doe - Tech Inc, John Lee - Events Co)",
-  "needs_data": true,
-  "queries": ["query { boards(ids: [5027403736]) { items_page(query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"john\\"], operator: contains_text}]}) { items { id name column_values { id text } } } } }"],
-  "action_type": "question",
-  "follow_up": "waiting for user to specify which John"
-}
-
-User: "proposal sent to acme corp"
-{
-  "message": "When did you send the proposal? I'll update the deal and add a note.",
-  "needs_data": false,
-  "queries": [],
-  "action_type": "question",
-  "follow_up": "waiting for date/time"
+  "follow_up": "What you're waiting for from user"
 }
 
 ═══════════════════════════════════════════════════════════════
 CRITICAL RULES
 ═══════════════════════════════════════════════════════════════
 
-1. ALWAYS ask for clarification when information is ambiguous
-2. NEVER execute destructive actions without confirmation
-3. ALWAYS provide context with your responses (counts, names, details)
-4. NEVER say "error" - handle gracefully and ask for help
-5. ALWAYS be conversational - you're a colleague, not a robot
-6. When showing data, format it clearly and offer next steps
-7. Remember conversation context - reference previous messages
-8. Be proactive - suggest actions based on data patterns
+1. NEVER execute writes without asking questions first
+2. ALWAYS provide context and suggest next steps
+3. ALWAYS ask for missing information (dates, values, details)
+4. NEVER say just "Done" - explain what you did
+5. ALWAYS offer related actions after completing a task
+6. BE CONVERSATIONAL - you're a colleague, not a robot
+7. REMEMBER context from previous messages
+8. BE PROACTIVE - suggest improvements and next steps
 
-You are the best AI assistant Sourabh has ever used. Act like it.`;
+You are the BEST AI assistant Sourabh has ever used. Every interaction should prove it.`;
 }
 
 // ============================================================
 // GEMINI AI - PRODUCTION GRADE
 // ============================================================
 
-async function callGemini(userMessage, dataContext = null) {
+async function callGemini(chatId, userMessage, dataContext = null) {
   // Build message with context
   let fullMessage = userMessage;
   if (dataContext) {
     fullMessage += `\n\n[DATA FROM MONDAY.COM]:\n${JSON.stringify(dataContext, null, 2)}`;
   }
   
-  // Add to history
+  // Add user message to memory
+  memory.addMessage(chatId, 'user', userMessage, dataContext ? { has_data: true } : null);
+  
+  // Get conversation history from database
+  const conversationHistory = memory.getGeminiHistory(chatId, 20);
+  
+  // Add current message
   conversationHistory.push({
     role: 'user',
     parts: [{ text: fullMessage }]
   });
-  
-  // Keep history manageable
-  while (conversationHistory.length > MAX_HISTORY) {
-    conversationHistory.shift();
-  }
   
   try {
     const response = await axios.post(
@@ -344,13 +355,11 @@ async function callGemini(userMessage, dataContext = null) {
       };
     }
     
-    // Add to history
-    conversationHistory.push({
-      role: 'model',
-      parts: [{ text: JSON.stringify(result) }]
+    // Add assistant response to memory
+    memory.addMessage(chatId, 'assistant', result.message, {
+      action_type: result.action_type,
+      needs_data: result.needs_data
     });
-    
-    saveConversation(conversationHistory);
     
     return result;
     
@@ -492,8 +501,8 @@ async function processMessage(chatId, messageText) {
   // Show typing
   await sendTypingIndicator(chatId);
   
-  // Step 1: Get AI response
-  const aiResponse = await callGemini(messageText);
+  // Step 1: Get AI response (with chat ID for memory)
+  const aiResponse = await callGemini(chatId, messageText);
   
   // Step 2: Execute queries if needed
   let mondayData = null;
@@ -504,6 +513,7 @@ async function processMessage(chatId, messageText) {
     // If this was a read operation, send data back to AI for formatting
     if (aiResponse.action_type === 'read') {
       const refinedResponse = await callGemini(
+        chatId,
         'Format this data clearly for Sourabh',
         mondayData
       );
@@ -517,7 +527,7 @@ async function processMessage(chatId, messageText) {
   
   // Step 4: Handle follow-up if needed
   if (aiResponse.follow_up && aiResponse.follow_up.trim() !== '') {
-    // Context is maintained in conversation history
+    // Context is maintained in database
     logger.info('Follow-up pending', { follow_up: aiResponse.follow_up });
   }
   
@@ -571,10 +581,20 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
     }
     
     if (text === '/clear') {
-      conversationHistory.length = 0;
-      saveConversation(conversationHistory);
+      memory.clearChat(chatId);
       queryCache.clear();
       await sendTelegramMessage(chatId, 'Conversation cleared. Fresh start!');
+      return;
+    }
+    
+    if (text === '/stats') {
+      const stats = memory.getStats(chatId);
+      await sendTelegramMessage(chatId,
+        `*Memory Stats:*\n` +
+        `• Messages: ${stats.messages}\n` +
+        `• Contexts stored: ${stats.contexts}\n` +
+        `• Session messages: ${stats.session?.message_count || 0}`
+      );
       return;
     }
     
@@ -587,12 +607,13 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  const globalStats = memory.getStats();
   res.json({
     status: 'ARIA V2 - PRODUCTION READY',
     timestamp: new Date().toISOString(),
     uptime: Math.round(process.uptime()),
     boards: Object.keys(CONFIG.monday.boards).length,
-    conversations: conversationHistory.length,
+    memory: globalStats,
   });
 });
 
@@ -638,7 +659,21 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception', { error: error.message, stack: error.stack });
+  memory.close();
   process.exit(1);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, closing memory database...');
+  memory.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, closing memory database...');
+  memory.close();
+  process.exit(0);
 });
 
 module.exports = { app, CONFIG };
