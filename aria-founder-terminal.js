@@ -890,6 +890,20 @@ app.get('/health', (req, res) => {
     uptime: Math.round(process.uptime()),
     boards: Object.keys(CONFIG.monday.boards).length,
     conversations: conversationHistory.length,
+    env_check: {
+      gemini_key: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 10) + '...' : 'MISSING',
+      gemini_model: CONFIG.gemini.model,
+      monday_token: process.env.MONDAY_API_TOKEN ? 'SET' : 'MISSING',
+      sales_board: CONFIG.monday.boards.sales.id,
+      artists_board: CONFIG.monday.boards.artists.id,
+      staff_board: CONFIG.monday.boards.staff.id,
+      base_url: process.env.BASE_URL || 'NOT SET',
+      columns_loaded: {
+        sales: boardColumns.sales?.length || 0,
+        artists: boardColumns.artists?.length || 0,
+        staff: boardColumns.staff?.length || 0,
+      },
+    },
   });
 });
 
