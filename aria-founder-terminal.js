@@ -874,8 +874,21 @@ async function processMessage(chatId, messageText) {
   // Show typing
   await sendTypingIndicator(chatId);
 
-  // Step 1: Get AI response
-  const aiResponse = await callAriaChain(chatId, messageText);
+  // Step 1: Get AI response (LangChain chain with fallback to direct Gemini)
+  let aiResponse;
+  try {
+    aiResponse = await callAriaChain(chatId, messageText);
+    logger.info('LangChain response received', { action_type: aiResponse.action_type, queries: aiResponse.queries?.length || 0 });
+  } catch (chainError) {
+    logger.error('LangChain chain failed, falling back to direct Gemini', { error: chainError.message, stack: chainError.stack });
+    try {
+      aiResponse = await callGemini(messageText);
+    } catch (geminiError) {
+      logger.error('Direct Gemini also failed', { error: geminiError.message });
+      await sendTelegramMessage(chatId, "I'm having trouble processing that. Please try again in a moment.");
+      return;
+    }
+  }
 
   // SAFETY NET: If Gemini failed to generate queries for obvious data requests, force a fallback
   const isDataRequest = /show|list|give|get|fetch|how many|how much|which|what|who|find|search|available|charge|price|pricing|status|tasks?|clients?|leads?|artists?|staff|team|assigned|breakdown/i.test(messageText);
@@ -938,8 +951,14 @@ async function processMessage(chatId, messageText) {
       // For writes, confirm with AI
       await sendTypingIndicator(chatId);
       const contextMessage = `The following mutations were executed. Confirm the results to Sourabh concisely.\n\nOriginal request: "${messageText}"`;
-      const refinedResponse = await callAriaChain(chatId, contextMessage, allResults);
-      await sendTelegramMessage(chatId, refinedResponse.message);
+      let refinedResponse;
+      try {
+        refinedResponse = await callAriaChain(chatId, contextMessage, allResults);
+      } catch (e) {
+        logger.error('Write confirmation chain failed, falling back', { error: e.message });
+        refinedResponse = await callGemini(contextMessage, allResults);
+      }
+      await sendTelegramMessage(chatId, refinedResponse.message || 'Operation completed.');
     }
 
     // Clear cache on writes
