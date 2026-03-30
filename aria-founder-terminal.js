@@ -832,7 +832,8 @@ async function sendTelegramMessage(chatId, text) {
         {
           chat_id: chatId,
           text: chunk,
-        }
+        },
+        { timeout: 10000 }
       );
     } catch (err) {
       logger.error('Failed to send Telegram message', { error: err.message });
@@ -844,7 +845,8 @@ async function sendTypingIndicator(chatId) {
   try {
     await axios.post(
       `${CONFIG.telegram.apiBase}/bot${CONFIG.telegram.botToken}/sendChatAction`,
-      { chat_id: chatId, action: 'typing' }
+      { chat_id: chatId, action: 'typing' },
+      { timeout: 10000 }
     );
   } catch (err) {
     // Ignore
@@ -1045,6 +1047,7 @@ async function fallbackFetchAll(originalRequest) {
   for (const board of boards) {
     const query = `query { boards(ids: [${board.id}]) { items_page(limit: 100) { items { id name column_values { id text value type } } } } }`;
     const result = await mondayQuery(query);
+    logger.info("After mondayQuery wait", { resultPreview: JSON.stringify(result).substring(0,100) });
     if (result && !result.error) {
       results.push(result);
     }
@@ -1515,7 +1518,16 @@ function extractItemIds(results) {
 
 // Clean up queries - remove empty ones and trim
 function resolveQueryPlaceholders(queries) {
-  return queries.filter(q => q && q.trim() !== '');
+  if (!queries || !Array.isArray(queries)) return [];
+  return queries
+    .filter(q => q && q.trim() !== '')
+    .map(query => {
+      let resolved = query;
+      resolved = resolved.replace(/\$\{SB\}/g, CONFIG.monday.boards.sales.id);
+      resolved = resolved.replace(/\$\{AB\}/g, CONFIG.monday.boards.artists.id);
+      resolved = resolved.replace(/\$\{TB\}/g, CONFIG.monday.boards.staff.id);
+      return resolved;
+  });
 }
 
 // ============================================================
@@ -1574,7 +1586,7 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ARIA V2 - PRODUCTION READY',
+    status: 'ARIA V3 - LANGCHAIN POWERED',
     timestamp: new Date().toISOString(),
     uptime: Math.round(process.uptime()),
     boards: Object.keys(CONFIG.monday.boards).length,
@@ -1605,6 +1617,7 @@ async function fetchBoardColumns() {
     try {
       const query = `query { boards(ids: [${board.id}]) { columns { id title type } } }`;
       const result = await mondayQuery(query);
+    logger.info("After mondayQuery wait", { resultPreview: JSON.stringify(result).substring(0,100) });
       if (result?.boards?.[0]?.columns) {
         boardColumns[key] = result.boards[0].columns;
         logger.info(`Fetched ${boardColumns[key].length} columns for ${board.name}`);
