@@ -4,6 +4,8 @@ data
 .git
 .vscode
 *.md
+!ARIA_SYSTEM_PROMPT.md
+!ARIA_SYSTEM_INTELLIGENCE.md
 test
 coverage
 .github
