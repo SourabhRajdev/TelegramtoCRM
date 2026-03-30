@@ -24,6 +24,7 @@ const logger = require('./lib/logger');
 const { sanitizeQueries } = require('./lib/sanitize');
 const Cache = require('./lib/cache');
 const { logAudit } = require('./lib/audit');
+const { initChain, callAriaChain, clearChatMemory } = require('./lib/aria-chain');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -874,7 +875,7 @@ async function processMessage(chatId, messageText) {
   await sendTypingIndicator(chatId);
 
   // Step 1: Get AI response
-  const aiResponse = await callGemini(messageText);
+  const aiResponse = await callAriaChain(chatId, messageText);
 
   // SAFETY NET: If Gemini failed to generate queries for obvious data requests, force a fallback
   const isDataRequest = /show|list|give|get|fetch|how many|how much|which|what|who|find|search|available|charge|price|pricing|status|tasks?|clients?|leads?|artists?|staff|team|assigned|breakdown/i.test(messageText);
@@ -937,7 +938,7 @@ async function processMessage(chatId, messageText) {
       // For writes, confirm with AI
       await sendTypingIndicator(chatId);
       const contextMessage = `The following mutations were executed. Confirm the results to Sourabh concisely.\n\nOriginal request: "${messageText}"`;
-      const refinedResponse = await callGemini(contextMessage, allResults);
+      const refinedResponse = await callAriaChain(chatId, contextMessage, allResults);
       await sendTelegramMessage(chatId, refinedResponse.message);
     }
 
@@ -1112,6 +1113,23 @@ function extractStatusFilter(query) {
   return null;
 }
 
+// Extract "empty column" filter from natural language query
+// e.g. "who has no tasks", "staff with no tasks assigned", "members without tasks"
+function extractEmptyColumnFilter(query) {
+  const q = query.toLowerCase();
+
+  // "no tasks" / "without tasks" / "no tasks assigned" / "not assigned any tasks"
+  if (/\b(no|without|zero|empty|don'?t have|hasn'?t|haven'?t|not assigned)\b.*\btask/i.test(q) ||
+      /\btask.*\b(empty|none|zero|missing|blank)\b/i.test(q)) {
+    return { field: 'tasks', empty: true };
+  }
+  // "no clients" / "without clients"
+  if (/\b(no|without|zero)\b.*\bclient/i.test(q)) {
+    return { field: 'clients', empty: true };
+  }
+  return null;
+}
+
 // Extract numeric filter from natural language query
 function extractNumericFilter(query) {
   const q = query.toLowerCase();
@@ -1281,6 +1299,42 @@ function formatReadResults(results, originalRequest) {
     });
     if (filtered.length > 0) {
       items = filtered;
+    }
+  }
+
+  // Apply "empty column" filter (e.g. "who has no tasks assigned")
+  const emptyFilter = extractEmptyColumnFilter(originalRequest);
+  if (emptyFilter) {
+    const filtered = items.filter(item => {
+      const columns = item.column_values || [];
+      if (emptyFilter.field === 'tasks') {
+        // Check long_text columns that hold tasks/projects
+        const taskCols = columns.filter(col =>
+          col.id.startsWith('long_text') &&
+          (getColumnTitle(col.id).toLowerCase().includes('task') ||
+           getColumnTitle(col.id).toLowerCase().includes('project') ||
+           getColumnTitle(col.id).toLowerCase().includes('assigned')));
+        // Also check numeric columns for task count
+        const countCols = columns.filter(col =>
+          col.id.startsWith('numeric') &&
+          (getColumnTitle(col.id).toLowerCase().includes('task') ||
+           getColumnTitle(col.id).toLowerCase().includes('active') ||
+           getColumnTitle(col.id).toLowerCase().includes('count')));
+        const hasNoTasks = taskCols.every(col => !col.text || col.text.trim() === '');
+        const hasZeroCount = countCols.some(col => col.text === '0' || !col.text);
+        return hasNoTasks || (taskCols.length === 0 && hasZeroCount);
+      }
+      if (emptyFilter.field === 'clients') {
+        const clientCols = columns.filter(col =>
+          getColumnTitle(col.id).toLowerCase().includes('client'));
+        return clientCols.every(col => !col.text || col.text.trim() === '');
+      }
+      return true;
+    });
+    if (filtered.length > 0) {
+      items = filtered;
+    } else {
+      return `Everyone has ${emptyFilter.field} assigned — no one is unassigned.`;
     }
   }
 
@@ -1483,6 +1537,7 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
     }
     
     if (text === '/clear') {
+      clearChatMemory(chatId);
       conversationHistory.length = 0;
       saveConversation(conversationHistory);
       queryCache.clear();
@@ -1573,11 +1628,34 @@ const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, async () => {
   logger.info('═══════════════════════════════════════════════');
-  logger.info('  ARIA V2 - PRODUCTION GRADE');
+  logger.info('  ARIA V3 - LANGCHAIN POWERED');
   logger.info('  Denicx Entertainment CRM');
   logger.info(`  Port: ${PORT}`);
   logger.info('═══════════════════════════════════════════════');
   await fetchBoardColumns();
+
+  // Initialize LangChain chain after board columns are loaded
+  try {
+    await initChain({
+      geminiApiKey: CONFIG.gemini.apiKey,
+      geminiModel: CONFIG.gemini.model,
+      boardIds: {
+        sales: CONFIG.monday.boards.sales.id,
+        artists: CONFIG.monday.boards.artists.id,
+        staff: CONFIG.monday.boards.staff.id,
+      },
+      formattedColumns: {
+        sales: formatColumnsForPrompt('sales'),
+        artists: formatColumnsForPrompt('artists'),
+        staff: formatColumnsForPrompt('staff'),
+      },
+    });
+    logger.info('LangChain ARIA chain initialized successfully');
+  } catch (err) {
+    logger.error('Failed to initialize LangChain chain', { error: err.message });
+    logger.warn('Falling back to direct Gemini calls');
+  }
+
   await registerWebhook();
   logger.info('Ready for production. 🚀');
 });
