@@ -854,7 +854,7 @@ async function sendTypingIndicator(chatId) {
 }
 
 // ============================================================
-// MAIN MESSAGE PROCESSOR
+// MAIN MESSAGE PROCESSOR - AGENT-AWARE
 // ============================================================
 
 async function processMessage(chatId, messageText) {
@@ -876,126 +876,117 @@ async function processMessage(chatId, messageText) {
   // Show typing
   await sendTypingIndicator(chatId);
 
-  // Step 1: Get AI response (LangChain chain with fallback to direct Gemini)
-  let aiResponse;
+  // Step 1: Invoke ARIA agent (with new decision protocol)
+  let agentOutput;
   try {
-    aiResponse = await callAriaChain(chatId, messageText);
-    logger.info('LangChain response received', { action_type: aiResponse.action_type, queries: aiResponse.queries?.length || 0 });
+    agentOutput = await callAriaChain(chatId, messageText);
+    logger.info('Agent response received', {
+      intent: agentOutput.intent,
+      board: agentOutput.entities?.board,
+      action_type: agentOutput.action_type,
+      queries: agentOutput.queries?.length || 0,
+    });
   } catch (chainError) {
-    logger.error('LangChain chain failed, falling back to direct Gemini', { error: chainError.message, stack: chainError.stack });
-    try {
-      aiResponse = await callGemini(messageText);
-    } catch (geminiError) {
-      logger.error('Direct Gemini also failed', { error: geminiError.message });
-      await sendTelegramMessage(chatId, "I'm having trouble processing that. Please try again in a moment.");
-      return;
-    }
+    logger.error('Agent chain failed', { error: chainError.message, stack: chainError.stack });
+    await sendTelegramMessage(chatId, "I'm having trouble processing that. Please try again in a moment.");
+    return;
   }
 
-  // SAFETY NET: If Gemini failed to generate queries for obvious data requests, force a fallback
-  const isDataRequest = /show|list|give|get|fetch|how many|how much|which|what|who|find|search|available|charge|price|pricing|status|tasks?|clients?|leads?|artists?|staff|team|assigned|breakdown/i.test(messageText);
-  if (isDataRequest && (!aiResponse.needs_data || !aiResponse.queries || aiResponse.queries.length === 0)) {
-    logger.warn('Gemini failed to generate queries for data request, forcing fallback', { message: messageText });
-    const fallbackResults = await fallbackFetchAll(messageText);
-    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
-      const formattedMessage = formatReadResults(fallbackResults, messageText);
-      await sendTelegramMessage(chatId, formattedMessage);
-      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
-      return;
-    }
-  }
-
-  // Step 2: Execute queries if needed
-  if (aiResponse.needs_data && aiResponse.queries && aiResponse.queries.length > 0) {
-    // Separate queries into phases: first execute lookups, then use results for mutations
-    const resolvedQueries = resolveQueryPlaceholders(aiResponse.queries);
-
-    // Phase 1: Execute lookup queries (queries without placeholders)
-    const lookupQueries = resolvedQueries.filter(q => !q.includes('ITEM_ID_PLACEHOLDER'));
-    const placeholderQueries = resolvedQueries.filter(q => q.includes('ITEM_ID_PLACEHOLDER'));
-
-    let allResults = [];
-
-    if (lookupQueries.length > 0) {
-      const lookupResults = await executeQueries(lookupQueries);
-      allResults = [...lookupResults];
-
-      // Phase 2: If there are placeholder queries, resolve them with IDs from lookup results
-      if (placeholderQueries.length > 0) {
-        const itemIds = extractItemIds(lookupResults);
-        if (itemIds.length > 0) {
-          const resolved = placeholderQueries.map(q => q.replace(/ITEM_ID_PLACEHOLDER/g, itemIds[0]));
-          const mutationResults = await executeQueries(resolved);
-          allResults = [...allResults, ...mutationResults];
-        } else {
-          logger.warn('No item IDs found to resolve placeholders');
-        }
-      }
-    }
-
-    // For READ operations: format data directly without second Gemini call
-    // For WRITE operations: make second call to confirm execution
-    if (aiResponse.action_type === 'read') {
-      // Check if results are empty — if so, try fallback fetch-all from relevant boards
-      let itemCount = countItemsInResults(allResults);
-      if (itemCount === 0) {
-        logger.info('Empty read results, attempting fallback fetch-all');
-        const fallbackResults = await fallbackFetchAll(messageText);
-        if (fallbackResults.length > 0) {
-          allResults = fallbackResults;
-        }
-      }
-
-      // Format read results directly
-      const formattedMessage = formatReadResults(allResults, messageText);
-      await sendTelegramMessage(chatId, formattedMessage);
-    } else {
-      // For writes, confirm with AI
-      await sendTypingIndicator(chatId);
-      const contextMessage = `The following mutations were executed. Confirm the results to Sourabh concisely.\n\nOriginal request: "${messageText}"`;
-      let refinedResponse;
-      try {
-        refinedResponse = await callAriaChain(chatId, contextMessage, allResults);
-      } catch (e) {
-        logger.error('Write confirmation chain failed, falling back', { error: e.message });
-        refinedResponse = await callGemini(contextMessage, allResults);
-      }
-      await sendTelegramMessage(chatId, refinedResponse.message || 'Operation completed.');
-    }
-
-    // Clear cache on writes
-    if (aiResponse.action_type === 'write') {
-      queryCache.clear();
-    }
-
+  // Step 2: Handle based on action type
+  
+  // CHAT / GREETING / QUESTION - No data needed
+  if (agentOutput.action_type === 'chat' || agentOutput.action_type === 'question') {
+    await sendTelegramMessage(chatId, agentOutput.message);
     logAudit({
-      type: aiResponse.action_type,
+      type: agentOutput.action_type,
+      intent: agentOutput.intent,
       message: messageText,
-      queriesExecuted: allResults.length,
+      queriesExecuted: 0,
     });
     return;
   }
 
-  // Step 3: Send response (no queries needed)
-  // Safety net: if AI returned no queries but this looks like a data request, fetch directly
-  const looksLikeDataQuery = /show|list|give|get|how many|who|which|find|search|tasks?|clients?|leads?|artists?|staff|team|assigned|available|status|breakdown|charge|pricing/i.test(messageText);
-  if (looksLikeDataQuery && (!aiResponse.needs_data || !aiResponse.queries || aiResponse.queries.length === 0)) {
-    logger.info('Data query detected but AI returned no queries — forcing fallback fetch');
-    const fallbackResults = await fallbackFetchAll(messageText);
-    if (fallbackResults.length > 0 && countItemsInResults(fallbackResults) > 0) {
-      const formattedMessage = formatReadResults(fallbackResults, messageText);
-      await sendTelegramMessage(chatId, formattedMessage);
-      logAudit({ type: 'read', message: messageText, queriesExecuted: fallbackResults.length });
-      return;
+  // ERROR - Something went wrong
+  if (agentOutput.action_type === 'error') {
+    await sendTelegramMessage(chatId, agentOutput.message || "I encountered an error processing that request.");
+    logAudit({
+      type: 'error',
+      intent: agentOutput.intent,
+      message: messageText,
+      queriesExecuted: 0,
+    });
+    return;
+  }
+
+  // READ / WRITE - Execute queries
+  if (!agentOutput.queries || agentOutput.queries.length === 0) {
+    logger.warn('Agent returned no queries for data operation', {
+      action_type: agentOutput.action_type,
+      intent: agentOutput.intent,
+    });
+    await sendTelegramMessage(chatId, "I couldn't generate the right query for that. Can you rephrase?");
+    return;
+  }
+
+  // Step 3: Execute queries
+  const resolvedQueries = resolveQueryPlaceholders(agentOutput.queries);
+  
+  // Phase 1: Execute lookup queries (queries without placeholders)
+  const lookupQueries = resolvedQueries.filter(q => !q.includes('ITEM_ID_PLACEHOLDER'));
+  const placeholderQueries = resolvedQueries.filter(q => q.includes('ITEM_ID_PLACEHOLDER'));
+
+  let allResults = [];
+
+  if (lookupQueries.length > 0) {
+    const lookupResults = await executeQueries(lookupQueries);
+    allResults = [...lookupResults];
+
+    // Phase 2: If there are placeholder queries, resolve them with IDs from lookup results
+    if (placeholderQueries.length > 0) {
+      const itemIds = extractItemIds(lookupResults);
+      if (itemIds.length > 0) {
+        const resolved = placeholderQueries.map(q => q.replace(/ITEM_ID_PLACEHOLDER/g, itemIds[0]));
+        const mutationResults = await executeQueries(resolved);
+        allResults = [...allResults, ...mutationResults];
+      } else {
+        logger.warn('No item IDs found to resolve placeholders');
+        await sendTelegramMessage(chatId, "I couldn't find that item. Check the name and try again.");
+        return;
+      }
     }
   }
 
-  await sendTelegramMessage(chatId, aiResponse.message);
+  // Step 4: Format and send response
+  
+  if (agentOutput.action_type === 'read') {
+    // For reads: Use agent's entities to enhance formatting
+    const formattedMessage = formatReadResultsWithContext(
+      allResults,
+      messageText,
+      agentOutput.entities
+    );
+    await sendTelegramMessage(chatId, formattedMessage);
+
+    // Send follow-up suggestion if provided
+    if (agentOutput.follow_up) {
+      await sendTelegramMessage(chatId, agentOutput.follow_up);
+    }
+
+  } else if (agentOutput.action_type === 'write') {
+    // For writes: Send agent's confirmation message
+    const confirmationMessage = agentOutput.message || 'Operation completed.';
+    await sendTelegramMessage(chatId, confirmationMessage);
+
+    // Clear cache on writes
+    queryCache.clear();
+  }
 
   logAudit({
-    type: aiResponse.action_type,
+    type: agentOutput.action_type,
+    intent: agentOutput.intent,
+    board: agentOutput.entities?.board,
     message: messageText,
-    queriesExecuted: 0,
+    queriesExecuted: allResults.length,
   });
 }
 
@@ -1211,7 +1202,153 @@ function itemMatchesPerson(item, personName) {
   return false;
 }
 
-// Format read results without calling Gemini again
+// Format read results with agent context (NEW - uses agent's extracted entities)
+function formatReadResultsWithContext(results, originalRequest, entities) {
+  // Use agent's extracted filters instead of regex parsing
+  if (entities && entities.filters && entities.filters.length > 0) {
+    return formatReadResultsWithFilters(results, originalRequest, entities);
+  }
+  
+  // Fallback to original formatter
+  return formatReadResults(results, originalRequest);
+}
+
+// Format read results applying agent-extracted filters
+function formatReadResultsWithFilters(results, originalRequest, entities) {
+  if (!results || results.length === 0) {
+    return 'No data found.';
+  }
+
+  let items = [];
+  let boardName = '';
+  
+  for (const result of results) {
+    if (!result || result.error) continue;
+
+    if (result.boards) {
+      for (const board of result.boards) {
+        if (!boardName && board.name) boardName = board.name;
+        const boardItems = board.items_page?.items || board.items || [];
+        items = items.concat(boardItems);
+      }
+    }
+
+    if (result.items) {
+      items = items.concat(result.items);
+    }
+  }
+
+  if (items.length === 0) {
+    return 'No items found.';
+  }
+
+  // Apply agent-extracted filters
+  for (const filter of entities.filters) {
+    items = applyAgentFilter(items, filter);
+  }
+
+  // Apply person name filter if provided
+  if (entities.person_name) {
+    items = items.filter(item => itemMatchesPerson(item, entities.person_name));
+  }
+
+  if (items.length === 0) {
+    const filterDesc = entities.filters.map(f => `${f.field} ${f.operator} ${f.value}`).join(', ');
+    return `No items found matching filters: ${filterDesc}`;
+  }
+
+  // Format results
+  const isTasksQuery = /tasks?|working on|assigned to/i.test(originalRequest);
+  const totalCount = items.length;
+  const itemsToShow = items.slice(0, 10);
+  
+  const itemStrings = itemsToShow.map((item, idx) => formatSingleItem(item, idx + 1, isTasksQuery));
+  
+  let header = '';
+  if (totalCount > 10) {
+    header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found. Showing 1-10 — reply 'next' for more.\n\n`;
+  } else {
+    header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found:\n\n`;
+  }
+
+  return header + itemStrings.join('\n\n');
+}
+
+// Apply a single agent-extracted filter to items
+function applyAgentFilter(items, filter) {
+  return items.filter(item => {
+    const columns = item.column_values || [];
+    
+    // Find column matching filter field
+    let targetCol = null;
+    
+    if (filter.field === 'experience' || filter.field.includes('year')) {
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes('experience') || title.includes('years');
+      });
+    } else if (filter.field === 'pricing' || filter.field === 'price') {
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes('pricing') || title.includes('price') || title.includes('charge');
+      });
+    } else if (filter.field === 'art_form' || filter.field === 'artform') {
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes('art') && title.includes('form');
+      });
+    } else if (filter.field === 'availability') {
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes('availability');
+      });
+    } else if (filter.field === 'status' || filter.field.includes('stage')) {
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes('status') || title.includes('stage') || title.includes('pipeline');
+      });
+    } else {
+      // Generic field match
+      targetCol = columns.find(col => {
+        const title = getColumnTitle(col.id).toLowerCase();
+        return title.includes(filter.field.toLowerCase());
+      });
+    }
+    
+    if (!targetCol || !targetCol.text) return false;
+    
+    const colValue = targetCol.text.toLowerCase();
+    const filterValue = filter.value.toLowerCase();
+    
+    // Apply operator
+    switch (filter.operator) {
+      case 'equals':
+        return colValue === filterValue;
+      case 'contains':
+        return colValue.includes(filterValue);
+      case 'greater_than':
+      case 'greater_equal':
+      case 'less_than':
+      case 'less_equal': {
+        const numMatch = targetCol.text.match(/(\d+)/);
+        if (!numMatch) return false;
+        const itemValue = parseInt(numMatch[1]);
+        const targetValue = parseInt(filter.value);
+        if (filter.operator === 'greater_than') return itemValue > targetValue;
+        if (filter.operator === 'greater_equal') return itemValue >= targetValue;
+        if (filter.operator === 'less_than') return itemValue < targetValue;
+        if (filter.operator === 'less_equal') return itemValue <= targetValue;
+        return false;
+      }
+      case 'not_equals':
+        return colValue !== filterValue;
+      default:
+        return true;
+    }
+  });
+}
+
+// Format read results without calling Gemini again (ORIGINAL - kept for fallback)
 function formatReadResults(results, originalRequest) {
   if (!results || results.length === 0) {
     return 'No data found.';
@@ -1669,23 +1806,24 @@ app.listen(PORT, async () => {
   // Initialize LangChain chain after board columns are loaded
   try {
     await initChain({
-      geminiApiKey: CONFIG.gemini.apiKey,
-      geminiModel: CONFIG.gemini.model,
+      gemini: {
+        apiKey: CONFIG.gemini.apiKey,
+        model: CONFIG.gemini.model,
+      },
       boardIds: {
         sales: CONFIG.monday.boards.sales.id,
         artists: CONFIG.monday.boards.artists.id,
         staff: CONFIG.monday.boards.staff.id,
       },
-      formattedColumns: {
-        sales: formatColumnsForPrompt('sales'),
-        artists: formatColumnsForPrompt('artists'),
-        staff: formatColumnsForPrompt('staff'),
-      },
+      salesColumns: boardColumns.sales,
+      artistsColumns: boardColumns.artists,
+      staffColumns: boardColumns.staff,
     });
     logger.info('LangChain ARIA chain initialized successfully');
   } catch (err) {
-    logger.error('Failed to initialize LangChain chain', { error: err.message });
-    logger.warn('Falling back to direct Gemini calls');
+    logger.error('Failed to initialize LangChain chain', { error: err.message, stack: err.stack });
+    logger.warn('System cannot start without LangChain - exiting');
+    process.exit(1);
   }
 
   await registerWebhook();
