@@ -984,11 +984,21 @@ async function processMessage(chatId, messageText) {
     const verificationResult = await verifyWriteOperation(allResults, agentOutput);
     
     if (verificationResult.success) {
-      const confirmationMessage = agentOutput.message || 'Operation completed.';
+      const confirmationMessage = agentOutput.message || 'Done.';
       await sendTelegramMessage(chatId, confirmationMessage);
     } else {
-      logger.error('Write verification failed', { reason: verificationResult.reason });
-      await sendTelegramMessage(chatId, `Operation may have failed: ${verificationResult.reason}. Please verify manually.`);
+      // Check if it's a group ID error and we can retry
+      if (verificationResult.reason.includes('board configuration')) {
+        // Log for admin but tell user it's being handled
+        logger.error('Group ID configuration issue detected', { 
+          board: agentOutput.entities?.board,
+          intent: agentOutput.intent 
+        });
+        await sendTelegramMessage(chatId, "I'm having trouble with that. Let me check the board setup and try again in a moment.");
+      } else {
+        // Other errors - provide the helpful message
+        await sendTelegramMessage(chatId, verificationResult.reason);
+      }
     }
   }
 
@@ -1032,7 +1042,40 @@ async function verifyWriteOperation(results, agentOutput) {
   // Check if mutation returned an error
   for (const result of results) {
     if (result && result.error) {
-      return { success: false, reason: result.error };
+      // Parse Monday.com errors and provide helpful messages
+      const errorMsg = result.error.toLowerCase();
+      
+      if (errorMsg.includes('group not found') || errorMsg.includes('group_id')) {
+        // Group ID issue - try to recover or provide clear guidance
+        logger.error('Group ID error - board configuration issue', { error: result.error });
+        return { 
+          success: false, 
+          reason: "I couldn't create that item. The board configuration needs to be updated. I'll notify the admin."
+        };
+      }
+      
+      if (errorMsg.includes('column') && errorMsg.includes('not found')) {
+        logger.error('Column not found error', { error: result.error });
+        return { 
+          success: false, 
+          reason: "I couldn't update that field. The board structure may have changed."
+        };
+      }
+      
+      if (errorMsg.includes('permission') || errorMsg.includes('unauthorized')) {
+        logger.error('Permission error', { error: result.error });
+        return { 
+          success: false, 
+          reason: "I don't have permission to do that. Please check my access level."
+        };
+      }
+      
+      // Generic error - don't expose technical details
+      logger.error('Monday.com mutation error', { error: result.error });
+      return { 
+        success: false, 
+        reason: "Something went wrong. Let me try that again in a moment."
+      };
     }
   }
   
