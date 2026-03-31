@@ -1452,7 +1452,7 @@ const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, async () => {
   logger.info('═══════════════════════════════════════════════');
-  logger.info('  ARIA V3 - LANGCHAIN POWERED');
+  logger.info('  ARIA V4.1 - REASONING DISCIPLINE');
   logger.info('  Denicx Entertainment CRM');
   logger.info(`  Port: ${PORT}`);
   logger.info('═══════════════════════════════════════════════');
