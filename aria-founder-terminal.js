@@ -107,11 +107,17 @@ function saveConversation(history) {
 
 const chatRateLimits = new Map();
 
-// Store board column schemas fetched at startup
+// Store board column schemas and groups fetched at startup
 const boardColumns = {
   sales: [],
   artists: [],
   staff: [],
+};
+
+const boardGroups = {
+  sales: 'topics',
+  artists: 'topics',
+  staff: 'topics',
 };
 
 function checkChatRateLimit(chatId) {
@@ -1516,12 +1522,18 @@ async function fetchBoardColumns() {
 async function fetchBoardColumns() {
   for (const [key, board] of Object.entries(CONFIG.monday.boards)) {
     try {
-      const query = `query { boards(ids: [${board.id}]) { columns { id title type } } }`;
+      // Fetch both columns and groups
+      const query = `query { boards(ids: [${board.id}]) { columns { id title type } groups { id title } } }`;
       const result = await mondayQuery(query);
     logger.info("After mondayQuery wait", { resultPreview: JSON.stringify(result).substring(0,100) });
       if (result?.boards?.[0]?.columns) {
         boardColumns[key] = result.boards[0].columns;
         logger.info(`Fetched ${boardColumns[key].length} columns for ${board.name}`);
+      }
+      // Store first group ID (or default to "topics")
+      if (result?.boards?.[0]?.groups && result.boards[0].groups.length > 0) {
+        boardGroups[key] = result.boards[0].groups[0].id;
+        logger.info(`Using group "${boardGroups[key]}" for ${board.name}`);
       }
     } catch (error) {
       logger.error(`Failed to fetch columns for ${board.name}`, { error: error.message });
