@@ -680,6 +680,33 @@ async function executeQueries(queries) {
     
     logger.info('Executing query', { query: query.substring(0, 100) });
     const result = await mondayQuery(query);
+    
+    // Check for rate limit errors
+    if (result.error_code === 'ComplexityException' || 
+        result.error_code === 'DAILY_LIMIT_EXCEEDED' ||
+        result.error_code === 'IP_RATE_LIMIT_EXCEEDED' ||
+        (result.error_message && /rate limit|minute limit|concurrency limit/i.test(result.error_message))) {
+      const retryAfter = result.retry_in_seconds || 60;
+      logger.error('Monday.com rate limit hit', { 
+        errorCode: result.error_code,
+        errorMessage: result.error_message,
+        retryAfter 
+      });
+      return [{ 
+        error: `Rate limit exceeded. Please wait ${retryAfter} seconds and try again.`,
+        error_code: result.error_code,
+        retry_in_seconds: retryAfter
+      }];
+    }
+    
+    // Log any other errors
+    if (result.error || result.errors) {
+      logger.error('Monday.com query error', { 
+        error: result.error || result.errors,
+        query: query.substring(0, 200)
+      });
+    }
+    
     results.push(result);
     
     // Small delay between queries
@@ -846,18 +873,85 @@ async function processMessage(chatId, messageText) {
 
   if (lookupQueries.length > 0) {
     const lookupResults = await executeQueries(lookupQueries);
+    
+    // Check for rate limit errors
+    if (lookupResults.length > 0 && lookupResults[0].error_code) {
+      const error = lookupResults[0];
+      if (error.error_code === 'ComplexityException' || 
+          error.error_code === 'DAILY_LIMIT_EXCEEDED' ||
+          error.error_code === 'IP_RATE_LIMIT_EXCEEDED') {
+        await sendTelegramMessage(chatId, error.error || "Rate limit exceeded. Please wait a moment and try again.");
+        return;
+      }
+    }
+    
+    // Debug logging for search operations
+    logger.info('Lookup query executed', {
+      queryPreview: lookupQueries[0].substring(0, 150),
+      resultsCount: lookupResults.length,
+      hasBoards: lookupResults[0]?.boards ? 'yes' : 'no',
+      boardsCount: lookupResults[0]?.boards?.length || 0,
+      itemsFound: extractItemIds(lookupResults).length,
+      personName: agentOutput.entities?.person_name || 'none',
+      board: agentOutput.entities?.board || 'unknown',
+    });
+    
     allResults = [...lookupResults];
 
     // Phase 2: If there are placeholder queries, resolve them with IDs from lookup results
     if (placeholderQueries.length > 0) {
-      const itemIds = extractItemIds(lookupResults);
+      let itemIds = extractItemIds(lookupResults);
+      
+      // FALLBACK STRATEGY: If no results and person name has multiple words, retry with first name
+      if (itemIds.length === 0 && agentOutput.entities?.person_name && agentOutput.entities.person_name.includes(' ')) {
+        const firstName = agentOutput.entities.person_name.split(' ')[0];
+        logger.info('Retrying search with first name only', { 
+          originalName: agentOutput.entities.person_name, 
+          firstName 
+        });
+        
+        // Generate new search query with first name only
+        const retryQuery = lookupQueries[0].replace(
+          new RegExp(agentOutput.entities.person_name.toLowerCase(), 'gi'),
+          firstName.toLowerCase()
+        );
+        
+        const retryResults = await executeQueries([retryQuery]);
+        itemIds = extractItemIds(retryResults);
+        
+        if (itemIds.length > 0) {
+          logger.info('Fallback search succeeded', { itemsFound: itemIds.length });
+          allResults = [...retryResults]; // Update results with retry
+        }
+      }
+      
       if (itemIds.length > 0) {
         const resolved = placeholderQueries.map(q => q.replace(/ITEM_ID_PLACEHOLDER/g, itemIds[0]));
         const mutationResults = await executeQueries(resolved);
         allResults = [...allResults, ...mutationResults];
       } else {
-        logger.warn('No item IDs found to resolve placeholders');
-        await sendTelegramMessage(chatId, "I couldn't find that item. Check the name and try again.");
+        // Build contextual error message
+        let errorMsg = "I couldn't find ";
+        if (agentOutput.entities?.person_name) {
+          errorMsg += `"${agentOutput.entities.person_name}"`;
+        } else {
+          errorMsg += "that item";
+        }
+        
+        if (agentOutput.entities?.board && agentOutput.entities.board !== 'unknown') {
+          errorMsg += ` in the ${agentOutput.entities.board} board`;
+        }
+        
+        errorMsg += ". Try using just the first name or check the exact spelling.";
+        
+        logger.warn('Item lookup failed after fallback', {
+          personName: agentOutput.entities?.person_name,
+          board: agentOutput.entities?.board,
+          intent: agentOutput.intent,
+          queriesExecuted: lookupQueries.length + (agentOutput.entities?.person_name?.includes(' ') ? 1 : 0),
+        });
+        
+        await sendTelegramMessage(chatId, errorMsg);
         return;
       }
     }
@@ -951,14 +1045,20 @@ function itemMatchesPerson(item, personName) {
   if (!personName) return true;
   const name = personName.toLowerCase();
 
-  // Check item name
+  // Check item name first (for Sales and Artists boards)
   if (item.name && item.name.toLowerCase().includes(name)) return true;
 
-  // Check all column values for the person name
-  const columns = item.column_values || [];
-  for (const col of columns) {
-    if (col.text && col.text.toLowerCase().includes(name)) return true;
+  // For Staff board, check "Person Name" column specifically (not all columns)
+  const personNameCol = (item.column_values || []).find(col => {
+    const title = getColumnTitle(col.id).toLowerCase();
+    return title === 'person name' || title === 'name' || title.includes('staff name');
+  });
+  
+  if (personNameCol && personNameCol.text && personNameCol.text.toLowerCase().includes(name)) {
+    return true;
   }
+  
+  // Don't match on other columns (like "Tasks" which might mention the person)
   return false;
 }
 
