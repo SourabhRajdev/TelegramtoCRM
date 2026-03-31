@@ -149,8 +149,8 @@ const TEST_CASES = [
 function validateReasoning(reasoning) {
   const issues = [];
   
-  if (!reasoning || reasoning.length < 30) {
-    issues.push('Reasoning too short (< 30 chars)');
+  if (!reasoning || reasoning.length < 150) {
+    issues.push('Reasoning too short (< 150 chars, ~30 words minimum)');
   }
   
   const genericPatterns = [

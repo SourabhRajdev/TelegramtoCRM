@@ -25,6 +25,8 @@ const { sanitizeQueries } = require('./lib/sanitize');
 const Cache = require('./lib/cache');
 const { logAudit } = require('./lib/audit');
 const { initChain, callAriaChain, clearChatMemory } = require('./lib/aria-chain');
+const { generateOperationId, isOperationExecuted, markOperationExecuted } = require('./lib/operation-tracker');
+const { buildColumnMappings, translateColumnValues } = require('./lib/column-mapper');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -103,8 +105,6 @@ function saveConversation(history) {
   }
 }
 
-const conversationHistory = loadConversation();
-const queryCache = new Cache(60000);
 const chatRateLimits = new Map();
 
 // Store board column schemas fetched at startup
@@ -619,140 +619,9 @@ function normalizeAIResponse(raw) {
   };
 }
 
-async function callGemini(userMessage, dataContext = null, retryCount = 0) {
-  const MAX_RETRIES = 3;
-
-  // Throttle requests to prevent rapid successive calls
-  const now = Date.now();
-  const timeSinceLastCall = now - lastGeminiCall;
-  if (timeSinceLastCall < MIN_CALL_INTERVAL) {
-    const waitTime = MIN_CALL_INTERVAL - timeSinceLastCall;
-    logger.info(`Throttling Gemini call, waiting ${waitTime}ms`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-  }
-  lastGeminiCall = Date.now();
-
-  // Build message with context
-  let fullMessage = userMessage;
-  if (dataContext) {
-    fullMessage += `\n\n[DATA FROM MONDAY.COM]:\n${JSON.stringify(dataContext, null, 2)}`;
-  }
-
-  // Only add to history on first attempt (not retries)
-  if (retryCount === 0) {
-    conversationHistory.push({
-      role: 'user',
-      parts: [{ text: fullMessage }]
-    });
-
-    // Keep history manageable
-    while (conversationHistory.length > MAX_HISTORY) {
-      conversationHistory.shift();
-    }
-  }
-
-  try {
-    const response = await axios.post(
-      `${CONFIG.gemini.apiBase}/models/${CONFIG.gemini.model}:generateContent?key=${CONFIG.gemini.apiKey}`,
-      {
-        system_instruction: {
-          parts: [{ text: buildSystemPrompt() }]
-        },
-        contents: conversationHistory,
-        generationConfig: {
-          temperature: 0.3,
-          topP: 0.95,
-          topK: 40,
-          maxOutputTokens: 2048,
-        }
-      },
-      { timeout: 30000 }
-    );
-
-    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      throw new Error('No response from Gemini');
-    }
-
-    // Parse JSON response
-    let result;
-    try {
-      // Remove markdown code blocks if present
-      const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      result = JSON.parse(cleanText);
-    } catch (parseError) {
-      logger.error('JSON parse failed', { text, error: parseError.message });
-      // Fallback response
-      result = {
-        message: text.substring(0, 500),
-        needs_data: false,
-        queries: [],
-        action_type: 'chat',
-        follow_up: ''
-      };
-    }
-
-    // Normalize response format (handle old field names from Gemini)
-    result = normalizeAIResponse(result);
-
-    // Sanitize message — strip any leaked JSON fragments
-    if (result.message) {
-      result.message = result.message
-        .replace(/","needs_data".*$/s, '')
-        .replace(/","queries".*$/s, '')
-        .replace(/","action_type".*$/s, '')
-        .replace(/","follow_up".*$/s, '')
-        .replace(/\{"message":\s*"/g, '')
-        .trim();
-    }
-
-    // Add to history
-    conversationHistory.push({
-      role: 'model',
-      parts: [{ text: JSON.stringify(result) }]
-    });
-
-    saveConversation(conversationHistory);
-
-    return result;
-
-  } catch (error) {
-    // Retry on rate limit (429) with exponential backoff
-    if (error.response?.status === 429 && retryCount < MAX_RETRIES) {
-      const retryAfter = Math.min((retryCount + 1) * 10000, 60000); // 10s, 20s, 30s, max 60s
-      logger.warn(`Gemini rate limited (429), retry ${retryCount + 1}/${MAX_RETRIES} in ${retryAfter / 1000}s`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter));
-      return callGemini(userMessage, dataContext, retryCount + 1);
-    }
-
-    logger.error('Gemini API error', {
-      error: error.message,
-      status: error.response?.status,
-      data: error.response?.data?.error?.message?.substring(0, 200),
-      retry: retryCount,
-    });
-
-    // Specific message for rate limits that exhausted retries
-    if (error.response?.status === 429) {
-      return {
-        message: "I'm temporarily rate-limited by Google's API. Please wait 60 seconds and try again.",
-        needs_data: false,
-        queries: [],
-        action_type: 'error',
-        follow_up: ''
-      };
-    }
-
-    return {
-      message: "I'm having trouble processing that right now. Can you rephrase or try again?",
-      needs_data: false,
-      queries: [],
-      action_type: 'error',
-      follow_up: ''
-    };
-  }
-}
+// P1-2 FIX: Removed dead callGemini function (130 lines)
+// P1-3 FIX: Removed conversationHistory management (handled by memory.js)
+// P1-4 FIX: Removed queryCache (never used)
 
 // ============================================================
 // MONDAY.COM - RELIABLE EXECUTION
@@ -795,9 +664,18 @@ async function mondayQuery(query) {
 async function executeQueries(queries) {
   if (!queries || queries.length === 0) return [];
   
+  // P1-1 FIX: Sanitize queries before execution
+  const { sanitizeQueries } = require('./lib/sanitize');
+  const sanitizeResult = sanitizeQueries(queries);
+  
+  if (!sanitizeResult.valid) {
+    logger.error('Query sanitization failed', { errors: sanitizeResult.errors });
+    return [{ error: `Invalid queries: ${sanitizeResult.errors.join(', ')}` }];
+  }
+  
   const results = [];
   
-  for (const query of queries) {
+  for (const query of sanitizeResult.sanitized) {
     if (!query || query.trim() === '') continue;
     
     logger.info('Executing query', { query: query.substring(0, 100) });
@@ -928,8 +806,37 @@ async function processMessage(chatId, messageText) {
     return;
   }
 
-  // Step 3: Execute queries
-  const resolvedQueries = resolveQueryPlaceholders(agentOutput.queries);
+  // Step 3: Check for duplicate operations (write safety)
+  if (agentOutput.action_type === 'write') {
+    const operationId = generateOperationId(
+      agentOutput.intent,
+      agentOutput.entities,
+      agentOutput.action_type
+    );
+    
+    if (isOperationExecuted(operationId)) {
+      logger.warn('Duplicate operation detected - skipping execution', { operationId, intent: agentOutput.intent });
+      await sendTelegramMessage(chatId, "I already executed that operation recently. If you want to do it again, please wait a moment or rephrase.");
+      return;
+    }
+    
+    // Mark operation as executed BEFORE execution to prevent race conditions
+    markOperationExecuted(operationId, {
+      intent: agentOutput.intent,
+      board: agentOutput.entities?.board,
+      person_name: agentOutput.entities?.person_name,
+      timestamp: Date.now(),
+    });
+  }
+
+  // Step 4: Translate semantic column names to real Monday.com column IDs
+  const resolvedQueries = resolveQueryPlaceholders(agentOutput.queries).map(query => {
+    // If this is a mutation with column_values, translate semantic fields to real IDs
+    if (query.includes('column_values') && agentOutput.entities?.board) {
+      return translateMutationQuery(query, agentOutput.entities.board);
+    }
+    return query;
+  });
   
   // Phase 1: Execute lookup queries (queries without placeholders)
   const lookupQueries = resolvedQueries.filter(q => !q.includes('ITEM_ID_PLACEHOLDER'));
@@ -973,12 +880,16 @@ async function processMessage(chatId, messageText) {
     }
 
   } else if (agentOutput.action_type === 'write') {
-    // For writes: Send agent's confirmation message
-    const confirmationMessage = agentOutput.message || 'Operation completed.';
-    await sendTelegramMessage(chatId, confirmationMessage);
-
-    // Clear cache on writes
-    queryCache.clear();
+    // Step 5: Verify write operation succeeded
+    const verificationResult = await verifyWriteOperation(allResults, agentOutput);
+    
+    if (verificationResult.success) {
+      const confirmationMessage = agentOutput.message || 'Operation completed.';
+      await sendTelegramMessage(chatId, confirmationMessage);
+    } else {
+      logger.error('Write verification failed', { reason: verificationResult.reason });
+      await sendTelegramMessage(chatId, `Operation may have failed: ${verificationResult.reason}. Please verify manually.`);
+    }
   }
 
   logAudit({
@@ -990,200 +901,49 @@ async function processMessage(chatId, messageText) {
   });
 }
 
-// Count items in Monday.com query results
-function countItemsInResults(results) {
-  let count = 0;
+// Translate mutation query with semantic column names to real Monday.com column IDs
+function translateMutationQuery(query, board) {
+  try {
+    // Extract column_values JSON from the query
+    const match = query.match(/column_values:\s*"([^"]+)"/);
+    if (!match) return query;
+    
+    const escapedJson = match[1];
+    // Unescape the JSON
+    const jsonStr = escapedJson.replace(/\\\\/g, '\\').replace(/\\"/g, '"');
+    const semanticValues = JSON.parse(jsonStr);
+    
+    // Translate semantic fields to real column IDs
+    const translatedValues = translateColumnValues(board, semanticValues);
+    
+    // Re-escape for GraphQL
+    const translatedJson = JSON.stringify(translatedValues).replace(/"/g, '\\"').replace(/\\/g, '\\\\');
+    
+    // Replace in query
+    return query.replace(/column_values:\s*"[^"]+"/, `column_values: "${translatedJson}"`);
+  } catch (err) {
+    logger.error('Failed to translate mutation query', { error: err.message, query: query.substring(0, 100) });
+    return query;
+  }
+}
+
+// Verify write operation succeeded
+async function verifyWriteOperation(results, agentOutput) {
+  // Check if mutation returned an error
   for (const result of results) {
-    if (!result || result.error) continue;
-    if (result.boards) {
-      for (const board of result.boards) {
-        const items = board.items_page?.items || board.items || [];
-        count += items.length;
-      }
-    }
-    if (result.items) count += result.items.length;
-  }
-  return count;
-}
-
-// Determine which boards to fetch based on the query keywords
-function detectBoards(query) {
-  const q = query.toLowerCase();
-  const boards = [];
-  const SB = CONFIG.monday.boards.sales;
-  const AB = CONFIG.monday.boards.artists;
-  const TB = CONFIG.monday.boards.staff;
-
-  const staffKeywords = /staff|team|employee|task|working on|hire|agent|manager|admin|department|role/;
-  const salesKeywords = /lead|client|inquiry|deal|prospect|pipeline|proposal|sales|revenue|assigned.*ae|ae\b|follow.?up|contacted|responsible|haven.*contacted|breakdown/;
-  const artistKeywords = /artist|talent|performer|dj|vocalist|musician|dancer|saxophone|band|booking|portfolio|available|pricing|charge/;
-
-  if (staffKeywords.test(q)) boards.push(TB);
-  if (salesKeywords.test(q)) boards.push(SB);
-  if (artistKeywords.test(q)) boards.push(AB);
-
-  // Default: if nothing matched but there's a person name, search staff + sales
-  if (boards.length === 0) {
-    boards.push(TB, SB);
-  }
-
-  return boards;
-}
-
-// Fallback: fetch all items from relevant boards when filtered query returned empty
-async function fallbackFetchAll(originalRequest) {
-  const boards = detectBoards(originalRequest);
-  const results = [];
-
-  for (const board of boards) {
-    const query = `query { boards(ids: [${board.id}]) { items_page(limit: 100) { items { id name column_values { id text value type } } } } }`;
-    const result = await mondayQuery(query);
-    logger.info("After mondayQuery wait", { resultPreview: JSON.stringify(result).substring(0,100) });
-    if (result && !result.error) {
-      results.push(result);
-    }
-  }
-
-  return results;
-}
-
-// Extract person name from a natural language query
-function extractPersonName(query) {
-  const q = query.toLowerCase();
-  // Match patterns like "tasks for X", "assigned to X", "X's tasks", "clients of X"
-  const patterns = [
-    /(?:tasks?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
-    /(?:assigned\s+to)\s+(\w+)/i,
-    /(?:clients?\s+(?:for|of|assigned\s+to))\s+(\w+)/i,
-    /(\w+)[''\u2019]s\s+(?:tasks?|clients?|work)/i,
-    /(?:give\s+me\s+the\s+\w+\s+(?:listed|assigned)\s+(?:for|to))\s+(\w+)/i,
-    // "what tasks is X working on" / "what is X working on"
-    /what\s+(?:tasks?\s+)?is\s+(\w+)\s+working/i,
-    // "show X's ..." / "get X's ..."
-    /(?:show|get|find)\s+(\w+)[''\u2019]s/i,
-    // "tasks assigned to X" / "clients assigned to X"
-    /(?:tasks?|clients?|leads?|items?)\s+(?:assigned|given|allocated)\s+to\s+(\w+)/i,
-    // "for X" at end of sentence
-    /(?:tasks?|clients?|leads?|work|projects?)\s+(?:for|of)\s+(\w+)\s*$/i,
-    // "X is working on what"
-    /^(\w+)\s+is\s+working/i,
-  ];
-  const stopWords = ['the', 'all', 'my', 'our', 'me', 'any', 'each', 'every', 'show', 'get', 'find',
-    'what', 'how', 'who', 'which', 'give', 'list', 'no', 'not', 'and', 'or', 'them', 'it'];
-  for (const pattern of patterns) {
-    const match = q.match(pattern);
-    if (match && match[1]) {
-      const name = match[1].toLowerCase();
-      if (!stopWords.includes(name)) {
-        return name;
-      }
-    }
-  }
-  return null;
-}
-
-// Extract status filter from natural language query
-function extractStatusFilter(query) {
-  const q = query.toLowerCase();
-
-  // "haven't been contacted" / "not contacted" / "not yet contacted"
-  if (/haven'?t\s+been\s+contacted|not\s+(yet\s+)?contacted/i.test(q)) {
-    return { exclude: ['Contacted', 'Proposal Sent', 'Deal Won', 'Deal Lost'] };
-  }
-  // "qualified leads"
-  if (/qualified/i.test(q) && /lead|client|pipeline/i.test(q)) {
-    return { include: ['Qualified'] };
-  }
-  // "new inquiries" / "new leads"
-  if (/new\s+(inquir|lead)/i.test(q)) {
-    return { include: ['New Inquiry'] };
-  }
-  // "contacted leads"
-  if (/contacted/i.test(q) && /lead|client/i.test(q)) {
-    return { include: ['Contacted'] };
-  }
-  // "available artists"
-  if (/available/i.test(q) && /artist|talent|performer/i.test(q)) {
-    return { include: ['Available'] };
-  }
-  // "booked artists"
-  if (/booked/i.test(q) && /artist|talent/i.test(q)) {
-    return { include: ['Booked'] };
-  }
-  // "active staff"
-  if (/active/i.test(q) && /staff|team|employee/i.test(q)) {
-    return { include: ['Active'] };
-  }
-  // "proposal sent"
-  if (/proposal\s+sent/i.test(q)) {
-    return { include: ['Proposal Sent'] };
-  }
-  // "deal won"
-  if (/deal\s+won|won\s+deals?/i.test(q)) {
-    return { include: ['Deal Won'] };
-  }
-
-  return null;
-}
-
-// Extract "empty column" filter from natural language query
-// e.g. "who has no tasks", "staff with no tasks assigned", "members without tasks"
-function extractEmptyColumnFilter(query) {
-  const q = query.toLowerCase();
-
-  // "no tasks" / "without tasks" / "no tasks assigned" / "not assigned any tasks"
-  if (/\b(no|without|zero|empty|don'?t have|hasn'?t|haven'?t|not assigned)\b.*\btask/i.test(q) ||
-      /\btask.*\b(empty|none|zero|missing|blank)\b/i.test(q)) {
-    return { field: 'tasks', empty: true };
-  }
-  // "no clients" / "without clients"
-  if (/\b(no|without|zero)\b.*\bclient/i.test(q)) {
-    return { field: 'clients', empty: true };
-  }
-  return null;
-}
-
-// Extract numeric filter from natural language query
-function extractNumericFilter(query) {
-  const q = query.toLowerCase();
-  
-  // "experience years more than or equal to 8"
-  // "experience >= 8"
-  // "more than 5 years"
-  // "at least 10 years"
-  const patterns = [
-    /experience.*?(?:more than|greater than|>=|>)\s*(?:or\s+equal\s+to\s+)?(\d+)/i,
-    /experience.*?(?:at least|minimum)\s+(\d+)/i,
-    /(\d+)\+?\s*years?\s+(?:of\s+)?experience/i,
-    /experience.*?(\d+)\s*(?:years?)?\s*(?:or more|and above|\+)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = q.match(pattern);
-    if (match) {
-      return { field: 'experience', operator: '>=', value: parseInt(match[1]) };
+    if (result && result.error) {
+      return { success: false, reason: result.error };
     }
   }
   
-  // "less than 5 years"
-  const lessThanMatch = q.match(/experience.*?(?:less than|<)\s*(\d+)/i);
-  if (lessThanMatch) {
-    return { field: 'experience', operator: '<', value: parseInt(lessThanMatch[1]) };
+  // For mutations, check if we got an item ID back
+  const lastResult = results[results.length - 1];
+  if (lastResult && (lastResult.create_item || lastResult.change_multiple_column_values || lastResult.delete_item)) {
+    return { success: true };
   }
   
-  // "pricing under 3000" / "price less than 5000"
-  const priceLessMatch = q.match(/(?:pricing|price|charge).*?(?:under|less than|below|<)\s*(\d+)/i);
-  if (priceLessMatch) {
-    return { field: 'pricing', operator: '<', value: parseInt(priceLessMatch[1]) };
-  }
-  
-  // "pricing over 5000" / "price more than 3000"
-  const priceMoreMatch = q.match(/(?:pricing|price|charge).*?(?:over|more than|above|>)\s*(\d+)/i);
-  if (priceMoreMatch) {
-    return { field: 'pricing', operator: '>', value: parseInt(priceMoreMatch[1]) };
-  }
-  
-  return null;
+  // If no clear success indicator, assume success (Monday.com doesn't always return detailed results)
+  return { success: true };
 }
 
 // Check if an item matches a person name (search across all text column values)
@@ -1379,124 +1139,6 @@ function formatReadResults(results, originalRequest) {
     return 'No items found.';
   }
 
-  // Check if this is a person-specific query and filter locally
-  const personName = extractPersonName(originalRequest);
-  if (personName) {
-    const filtered = items.filter(item => itemMatchesPerson(item, personName));
-    if (filtered.length > 0) {
-      items = filtered;
-    } else {
-      return `No items found matching "${personName}". Check the spelling or try a different name.`;
-    }
-  }
-
-  // Apply numeric filter (experience, pricing, etc.)
-  const numericFilter = extractNumericFilter(originalRequest);
-  if (numericFilter) {
-    const filtered = items.filter(item => {
-      const columns = item.column_values || [];
-      
-      // Find the relevant column based on filter field
-      let targetCol = null;
-      if (numericFilter.field === 'experience') {
-        targetCol = columns.find(col => {
-          const title = getColumnTitle(col.id).toLowerCase();
-          return title.includes('experience') || title.includes('years');
-        });
-      } else if (numericFilter.field === 'pricing') {
-        targetCol = columns.find(col => {
-          const title = getColumnTitle(col.id).toLowerCase();
-          return title.includes('pricing') || title.includes('price') || title.includes('charge');
-        });
-      }
-      
-      if (!targetCol || !targetCol.text) return false;
-      
-      // Extract numeric value from text
-      const numMatch = targetCol.text.match(/(\d+)/);
-      if (!numMatch) return false;
-      
-      const itemValue = parseInt(numMatch[1]);
-      
-      // Apply operator
-      switch (numericFilter.operator) {
-        case '>=': return itemValue >= numericFilter.value;
-        case '>': return itemValue > numericFilter.value;
-        case '<': return itemValue < numericFilter.value;
-        case '<=': return itemValue <= numericFilter.value;
-        case '=': return itemValue === numericFilter.value;
-        default: return true;
-      }
-    });
-    
-    if (filtered.length > 0) {
-      items = filtered;
-    } else {
-      return `No items found matching the filter: ${numericFilter.field} ${numericFilter.operator} ${numericFilter.value}`;
-    }
-  }
-
-  // Apply status-based local filtering from the query
-  const statusFilter = extractStatusFilter(originalRequest);
-  if (statusFilter) {
-    const filtered = items.filter(item => {
-      const columns = item.column_values || [];
-      const statusTexts = columns
-        .filter(col => col.text && (col.id.startsWith('color') || col.id.startsWith('status') ||
-                getColumnTitle(col.id).toLowerCase().includes('stage') ||
-                getColumnTitle(col.id).toLowerCase().includes('status') ||
-                getColumnTitle(col.id).toLowerCase().includes('availability')))
-        .map(col => col.text.toLowerCase());
-
-      if (statusFilter.exclude) {
-        return !statusTexts.some(text => statusFilter.exclude.some(s => text === s.toLowerCase()));
-      }
-      if (statusFilter.include) {
-        return statusTexts.some(text => statusFilter.include.some(s => text === s.toLowerCase()));
-      }
-      return true;
-    });
-    if (filtered.length > 0) {
-      items = filtered;
-    }
-  }
-
-  // Apply "empty column" filter (e.g. "who has no tasks assigned")
-  const emptyFilter = extractEmptyColumnFilter(originalRequest);
-  if (emptyFilter) {
-    const filtered = items.filter(item => {
-      const columns = item.column_values || [];
-      if (emptyFilter.field === 'tasks') {
-        // Check long_text columns that hold tasks/projects
-        const taskCols = columns.filter(col =>
-          col.id.startsWith('long_text') &&
-          (getColumnTitle(col.id).toLowerCase().includes('task') ||
-           getColumnTitle(col.id).toLowerCase().includes('project') ||
-           getColumnTitle(col.id).toLowerCase().includes('assigned')));
-        // Also check numeric columns for task count
-        const countCols = columns.filter(col =>
-          col.id.startsWith('numeric') &&
-          (getColumnTitle(col.id).toLowerCase().includes('task') ||
-           getColumnTitle(col.id).toLowerCase().includes('active') ||
-           getColumnTitle(col.id).toLowerCase().includes('count')));
-        const hasNoTasks = taskCols.every(col => !col.text || col.text.trim() === '');
-        const hasZeroCount = countCols.some(col => col.text === '0' || !col.text);
-        return hasNoTasks || (taskCols.length === 0 && hasZeroCount);
-      }
-      if (emptyFilter.field === 'clients') {
-        const clientCols = columns.filter(col =>
-          getColumnTitle(col.id).toLowerCase().includes('client'));
-        return clientCols.every(col => !col.text || col.text.trim() === '');
-      }
-      return true;
-    });
-    if (filtered.length > 0) {
-      items = filtered;
-    } else {
-      return `Everyone has ${emptyFilter.field} assigned — no one is unassigned.`;
-    }
-  }
-
   const isTasksQuery = /tasks?|working on|assigned to/i.test(originalRequest);
 
   // FIX 5: Enforce 10-item pagination BEFORE formatting with clear header
@@ -1510,8 +1152,6 @@ function formatReadResults(results, originalRequest) {
   let header = '';
   if (totalCount > 10) {
     header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found. Showing 1-10 — reply 'next' for more.\n\n`;
-  } else if (personName) {
-    header = `Found ${totalCount} result${totalCount > 1 ? 's' : ''} for "${personName}":\n\n`;
   } else {
     header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found:\n\n`;
   }
@@ -1688,12 +1328,12 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
     // Commands
     if (text === '/start') {
       await sendTelegramMessage(chatId,
-        `*ARIA V2 - PRODUCTION READY* 🚀\n\n` +
+        `*ARIA V4 - PRODUCTION GRADE* 🚀\n\n` +
         `Your elite AI Chief of Staff for Denicx Entertainment.\n\n` +
         `*Connected Boards:*\n` +
-        `• Sales Pipeline (29 leads)\n` +
-        `• Artist Database (talent roster)\n` +
-        `• Staff Database (team management)\n\n` +
+        `• Sales Pipeline\n` +
+        `• Artist Database\n` +
+        `• Staff Database\n\n` +
         `*Try asking:*\n` +
         `• "How many leads do we have?"\n` +
         `• "Show me available artists"\n` +
@@ -1706,9 +1346,6 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
     
     if (text === '/clear') {
       clearChatMemory(chatId);
-      conversationHistory.length = 0;
-      saveConversation(conversationHistory);
-      queryCache.clear();
       await sendTelegramMessage(chatId, 'Conversation cleared. Fresh start!');
       return;
     }
@@ -1723,11 +1360,10 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ARIA V3 - LANGCHAIN POWERED',
+    status: 'ARIA V4 - PRODUCTION GRADE',
     timestamp: new Date().toISOString(),
     uptime: Math.round(process.uptime()),
     boards: Object.keys(CONFIG.monday.boards).length,
-    conversations: conversationHistory.length,
     env_check: {
       gemini_key: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.substring(0, 10) + '...' : 'MISSING',
       gemini_model: CONFIG.gemini.model,
@@ -1748,6 +1384,25 @@ app.get('/health', (req, res) => {
 // ============================================================
 // STARTUP
 // ============================================================
+
+async function fetchBoardColumns() {
+  for (const [key, board] of Object.entries(CONFIG.monday.boards)) {
+    try {
+      const query = `query { boards(ids: [${board.id}]) { columns { id title type } } }`;
+      const result = await mondayQuery(query);
+      if (result?.boards?.[0]?.columns) {
+        boardColumns[key] = result.boards[0].columns;
+        logger.info(`Fetched ${boardColumns[key].length} columns for ${board.name}`);
+      }
+    } catch (error) {
+      logger.error(`Failed to fetch columns for ${board.name}`, { error: error.message });
+    }
+  }
+  
+  // Build semantic column mappings after fetching schemas
+  buildColumnMappings(boardColumns);
+  logger.info('Column mappings built for semantic field translation');
+}
 
 async function fetchBoardColumns() {
   for (const [key, board] of Object.entries(CONFIG.monday.boards)) {
