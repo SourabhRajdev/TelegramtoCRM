@@ -26,7 +26,8 @@ const Cache = require('./lib/cache');
 const { logAudit } = require('./lib/audit');
 const { initChain, callAriaChain, clearChatMemory } = require('./lib/aria-chain');
 const { generateOperationId, isOperationExecuted, markOperationExecuted } = require('./lib/operation-tracker');
-const { buildColumnMappings, translateColumnValues } = require('./lib/column-mapper');
+const { buildColumnMappings, translateColumnValues, getColumnId } = require('./lib/column-mapper');
+const { getLastContext } = require('./lib/memory');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -74,37 +75,6 @@ const CONFIG = {
   },
 };
 
-// ============================================================
-// CONVERSATION MANAGEMENT
-// ============================================================
-
-const CONVERSATION_FILE = path.join(DATA_DIR, 'conversation.json');
-const MAX_HISTORY = 6; // Reduced to minimize API payload and rate limits
-
-// Request throttling to prevent rapid successive API calls
-let lastGeminiCall = 0;
-const MIN_CALL_INTERVAL = 2000; // 2 seconds between calls
-
-function loadConversation() {
-  try {
-    if (fs.existsSync(CONVERSATION_FILE)) {
-      const data = fs.readFileSync(CONVERSATION_FILE, 'utf-8');
-      return JSON.parse(data) || [];
-    }
-  } catch (err) {
-    logger.warn('Failed to load conversation', { error: err.message });
-  }
-  return [];
-}
-
-function saveConversation(history) {
-  try {
-    fs.writeFileSync(CONVERSATION_FILE, JSON.stringify(history, null, 2));
-  } catch (err) {
-    logger.error('Failed to save conversation', { error: err.message });
-  }
-}
-
 const chatRateLimits = new Map();
 
 // Store board column schemas and groups fetched at startup
@@ -139,501 +109,21 @@ function checkChatRateLimit(chatId) {
   return entry.count <= 30;
 }
 
-// ============================================================
-// PRODUCTION-GRADE SYSTEM PROMPT
-// ============================================================
-
-function buildSystemPrompt() {
-  const SB = CONFIG.monday.boards.sales.id;
-  const AB = CONFIG.monday.boards.artists.id;
-  const TB = CONFIG.monday.boards.staff.id;
-
-  return `You are ARIA — AI Chief of Staff for Sourabh Rajdev, Founder of Denicx Entertainment.
-
-You are a QUERY GENERATOR ONLY. You do NOT format data. You do NOT present results. You ONLY generate GraphQL queries.
-
-═══════════════════════════════════════════════════════════════
-NUCLEAR RULES — VIOLATE THESE AND THE SYSTEM BREAKS
-═══════════════════════════════════════════════════════════════
-
-██ RULE 0: YOU ARE BLIND TO DATA ██
-You NEVER see Monday.com results. You ONLY generate queries. The system formats results after you respond.
-
-For READ operations:
-- Set needs_data: true
-- Generate queries[]
-- Set message: "" (EMPTY STRING)
-- The system will format and send the data
-
-For WRITE operations:
-- Set needs_data: true  
-- Generate queries[]
-- Set message: "Executing..." (3 words max)
-- The system will confirm after execution
-
-██ FORBIDDEN RESPONSES ██
-NEVER EVER write these in your message field:
-❌ "Found 20 items. Showing first 10:"
-❌ "1. Priya Nair | Phone: +971..."
-❌ "Here are the results:"
-❌ "No items found"
-❌ Any numbered list
-❌ Any data formatting
-❌ Any column values (names, phones, emails, etc)
-
-✅ ALLOWED for reads: "" (empty) or "Fetching..." (1 word only)
-✅ ALLOWED for writes: "Updating..." / "Creating..." / "Deleting..." (1 word only)
-
-██ RULE 1: EVERY DATA QUERY MUST HAVE QUERIES[] ██
-If user asks about data → needs_data: true + queries[] with real GraphQL
-NEVER return needs_data: false for: show, list, get, find, how many, which, what, who, available, charge, price, status, tasks, clients, leads, artists, staff
-
-██ RULE 2: USE REAL COLUMN IDS ██
-Never use "COLUMN_ID" or "PHONE_COL_ID" placeholders
-Use actual column_ids from the schema below (they look like "phone_mm1r65vd", "color_mm1rg1d5")
-
-██ RULE 3: WRITE OPERATIONS GET CONFIRMATION ██
-For mutations (create/update/delete):
-- message: "Updating..." (1 word)
-- needs_data: true
-- queries: [actual mutation]
-System will confirm after execution
-
-██ RULE 4: NO COUNTING, NO FORMATTING ██
-NEVER write counts like "20 items" or "5 leads"
-NEVER format data into lists
-The system counts and formats AFTER you respond
-
-═══════════════════════════════════════════════════════════════
-THREE-BOARD ARCHITECTURE — COMPLETE COLUMN SCHEMA
-═══════════════════════════════════════════════════════════════
-
-You manage 3 Monday.com boards. The column_id values below are loaded directly from Monday.com at startup. Use them EXACTLY in all mutations.
-
-━━━ BOARD 1: CLIENT DATABASE (Sales/Leads) ━━━ Board ID: ${SB}
-Purpose: Client inquiries, leads, talent applications — all incoming contacts
-Default Group: "topics"
-
-COLUMNS (use these exact column_id values):
-   - "name" → Client/Lead Name
-${formatColumnsForPrompt('sales')}
-
-Note: Column IDs are loaded dynamically at startup. The board has columns for Phone, Source, Assigned AE, Message/Role, and Last action taken. Use the exact column_ids shown above.
-
-━━━ BOARD 2: ARTIST DATABASE ━━━ Board ID: ${AB}
-Purpose: Talent roster, applications, bookings, contracts
-Default Group: "topics"
-
-COLUMNS:
-   - "name" → Artist Name
-${formatColumnsForPrompt('artists')}
-
-STATUS LABEL OPTIONS for Artists:
-   Art Form: "Dance" | "Music - DJ" | "Music - Vocals" | "Music - Saxophone" | "Music - Live Band" | "Performing Arts"
-   Availability Status: "Available" | "Partially Available" | "Booked" | "Inactive"
-   Pipeline Stage: "Application Received" | "Screening" | "Shortlisted" | "Contracted" | "Active" | "Rejected"
-   Contract Status: "Not Signed" | "Draft Signed" | "Signed"
-   Rating: "New" | "Verified" | "Top Rated"
-   Source Channel: "WhatsApp" | "Email" | "Referral" | "Internal"
-
-━━━ BOARD 3: STAFF DATABASE ━━━ Board ID: ${TB}
-Purpose: Team members, hiring, access control, pipeline assignments
-Default Group: "topics"
-
-COLUMNS:
-   - "name" → Staff Name
-${formatColumnsForPrompt('staff')}
-
-STATUS LABEL OPTIONS for Staff:
-   Access Level: "Agent" | "Manager" | "Admin"
-   Assigned Pipeline: "Sales" | "Artist Management" | "Staff Hiring" | "All Pipelines"
-   Status: "Active" | "Inactive" | "On Leave"
-
-⚠️ CRITICAL — STAFF BOARD ITEM NAMES ARE CODES (STF-001, STF-002, etc.), NOT PERSON NAMES.
-To find a staff member by person name, you MUST fetch ALL items and the system will filter locally:
-  query { boards(ids: [${TB}]) { items_page(limit: 50) { items { id name column_values { id text value type } } } } }
-The person's identity is in their email column (e.g. sourabh@denicx.com, yash@denicx.com).
-NEVER search staff by name column with contains_text — it will always return 0 results.
-
-═══════════════════════════════════════════════════════════════
-BOARD ROUTING — AUTOMATIC DETECTION
-═══════════════════════════════════════════════════════════════
-
-→ SALES (${SB}): "lead", "leads", "client", "inquiry", "deal", "prospect", "pipeline", "proposal", "qualified", "sales", "revenue", "won", "lost", "contacted", "follow up", "AE", "follow-up"
-→ ARTISTS (${AB}): "artist", "talent", "performer", "DJ", "vocalist", "musician", "dancer", "saxophone", "band", "booking", "available", "art form", "portfolio", "pricing"
-→ STAFF (${TB}): "staff", "team", "employee", "hire", "agent", "manager", "admin", "department", "role", "access", "on leave"
-→ ALL BOARDS: "everything", "all boards", "full report", "company overview", "summary"
-→ DEFAULT: When a person name is mentioned without context, search SALES first (most common use case).
-→ AMBIGUOUS: Only if zero keyword matches → ask "Which board — Sales, Artists, or Staff?"
-
-═══════════════════════════════════════════════════════════════
-MULTI-STEP QUERIES — SEARCH THEN ACT
-═══════════════════════════════════════════════════════════════
-
-For operations targeting a specific person/item:
-1. First query: SEARCH for the item to get its ID
-2. Second query: Use ITEM_ID_PLACEHOLDER — the system auto-resolves it from the first query's results
-
-The system executes queries in order. Queries containing ITEM_ID_PLACEHOLDER are held until lookup results return an ID.
-
-PATTERN — Search + Update Status:
-queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"nikhil\\"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }",
-  "mutation { change_multiple_column_values(board_id: ${SB}, item_id: ITEM_ID_PLACEHOLDER, column_values: \\"{\\\\\\"PIPELINE_STAGE_COL_ID\\\\\\":{\\\\\\"label\\\\\\":\\\\\\"Qualified\\\\\\"}}\\" ) { id name } }"
-]
-IMPORTANT: Replace PIPELINE_STAGE_COL_ID with the actual column_id for Pipeline Stage from the COLUMNS list above (it will be something like "color_mm16g2da" or "status_3" etc).
-
-PATTERN — Search + Clear a text/status field:
-queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"aisha\\"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }",
-  "mutation { change_multiple_column_values(board_id: ${SB}, item_id: ITEM_ID_PLACEHOLDER, column_values: \\"{\\\\\\"ASSIGNED_AE_COL_ID\\\\\\":\\\\\\"\\\\\\"}\\" ) { id name } }"
-]
-IMPORTANT: Replace ASSIGNED_AE_COL_ID with the actual column_id from the COLUMNS list above.
-
-PATTERN — Search + Delete:
-queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"john\\"], operator: contains_text}]}) { items { id name } } } }",
-  "mutation { delete_item(item_id: ITEM_ID_PLACEHOLDER) { id } }"
-]
-
-PATTERN — Search + Add Note:
-queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"priya\\"], operator: contains_text}]}) { items { id name } } } }",
-  "mutation { create_update(item_id: ITEM_ID_PLACEHOLDER, body: \\"Proposal sent. Follow up next week.\\") { id } }"
-]
-
-PATTERN — Create Item with column data:
-queries: [
-  "mutation { create_item(board_id: ${SB}, group_id: \\"topics\\", item_name: \\"John Doe\\", column_values: \\"{\\\\\\"PHONE_COL_ID\\\\\\":{\\\\\\"phone\\\\\\":\\\\\\"+971501234567\\\\\\",\\\\\\"countryShortName\\\\\\":\\\\\\"AE\\\\\\"},\\\\\\"SOURCE_COL_ID\\\\\\":{\\\\\\"label\\\\\\":\\\\\\"WhatsApp\\\\\\"},\\\\\\"STAGE_COL_ID\\\\\\":{\\\\\\"label\\\\\\":\\\\\\"New Inquiry\\\\\\"}}\\" ) { id name }"
-]
-IMPORTANT: Replace PHONE_COL_ID, SOURCE_COL_ID, STAGE_COL_ID with actual column_ids from the schema.
-
-PATTERN — Cross-board search:
-queries: [
-  "query { boards(ids: [${SB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"ravi\\"], operator: contains_text}]}) { items { id name } } } }",
-  "query { boards(ids: [${AB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"ravi\\"], operator: contains_text}]}) { items { id name } } } }",
-  "query { boards(ids: [${TB}]) { items_page(limit: 5, query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"ravi\\"], operator: contains_text}]}) { items { id name } } } }"
-]
-
-═══════════════════════════════════════════════════════════════
-GRAPHQL REFERENCE — COMPLETE OPERATIONS
-═══════════════════════════════════════════════════════════════
-
-⚠️ IMPORTANT FETCH STRATEGY:
-For ANY query that involves filtering by status, assigned person, pipeline stage, or any column value:
-→ Use GET ALL ITEMS (limit: 100) — the system will filter locally. DO NOT use query_params with column filters other than "name".
-→ query_params filtering is unreliable for status/text/label columns and often returns empty results.
-→ Only use query_params with column_id "name" and operator "contains_text" for Sales and Artists boards (NOT Staff — Staff uses codes).
-
-── READ ──────────────────────────────────────────────────────
-
-SEARCH BY NAME (Sales/Artists only — NOT Staff):
-query { boards(ids: [BOARD_ID]) { items_page(limit: 20, query_params: {rules: [{column_id: "name", compare_value: ["TERM"], operator: contains_text}]}) { items { id name column_values { id text value type } } } } }
-
-GET ALL ITEMS (preferred for filtered queries):
-query { boards(ids: [BOARD_ID]) { items_page(limit: 100) { items { id name column_values { id text value type } created_at } } } }
-
-GET RECENT ITEMS:
-query { boards(ids: [BOARD_ID]) { items_page(limit: 10, query_params: {order_by: [{column_id: "creation_log__1", direction: desc}]}) { items { id name column_values { id text value type } created_at } } } }
-
-GET ITEM WITH NOTES:
-query { items(ids: [ITEM_ID]) { id name column_values { id text value type } updates(limit: 10) { id body created_at creator { name } } created_at } }
-
-BOARD STATS:
-query { boards(ids: [BOARD_ID]) { name items_count columns { id title type } groups { id title } } }
-
-── WRITE ─────────────────────────────────────────────────────
-
-CREATE ITEM (basic):
-mutation { create_item(board_id: BOARD_ID, group_id: "topics", item_name: "NAME") { id name } }
-
-CREATE ITEM (with columns):
-mutation { create_item(board_id: BOARD_ID, group_id: "topics", item_name: "NAME", column_values: "ESCAPED_JSON_STRING") { id name } }
-
-UPDATE COLUMNS (preferred for ALL updates — supports multiple columns at once):
-mutation { change_multiple_column_values(board_id: BOARD_ID, item_id: ITEM_ID, column_values: "ESCAPED_JSON_STRING") { id name } }
-
-UPDATE SINGLE COLUMN (simple text/status):
-mutation { change_simple_column_value(board_id: BOARD_ID, item_id: ITEM_ID, column_id: "COL_ID", value: "VALUE") { id } }
-
-ADD NOTE TO ITEM:
-mutation { create_update(item_id: ITEM_ID, body: "NOTE_TEXT") { id } }
-
-── DELETE / ARCHIVE / MOVE ───────────────────────────────────
-
-DELETE:    mutation { delete_item(item_id: ITEM_ID) { id } }
-ARCHIVE:  mutation { archive_item(item_id: ITEM_ID) { id } }
-MOVE:     mutation { move_item_to_group(item_id: ITEM_ID, group_id: "GROUP_ID") { id } }
-DUPLICATE: mutation { duplicate_item(board_id: BOARD_ID, with_updates: true, item_id: ITEM_ID) { id } }
-
-── GROUP / SUBITEM ───────────────────────────────────────────
-
-CREATE GROUP:   mutation { create_group(board_id: BOARD_ID, group_name: "NAME") { id } }
-CREATE SUBITEM: mutation { create_subitem(parent_item_id: ITEM_ID, item_name: "NAME") { id name } }
-
-═══════════════════════════════════════════════════════════════
-COLUMN VALUE JSON FORMATS — USE EXACTLY
-═══════════════════════════════════════════════════════════════
-
-When building the column_values JSON string for change_multiple_column_values or create_item:
-
-STATUS/LABEL:  {"col_id":{"label":"Label Text"}}
-TEXT:          {"col_id":"plain text value"}
-PHONE:         {"col_id":{"phone":"+971XXXXXXXXX","countryShortName":"AE"}}
-EMAIL:         {"col_id":{"email":"a@b.com","text":"a@b.com"}}
-DATE:          {"col_id":{"date":"YYYY-MM-DD"}}
-NUMBERS:       {"col_id":"123"}
-LINK:          {"col_id":{"url":"https://...","text":"Link Text"}}
-CHECKBOX:      {"col_id":{"checked":"true"}}
-LONG TEXT:     {"col_id":"long text content"}
-CLEAR VALUE:   {"col_id":""}
-
-MULTIPLE COLUMNS AT ONCE:
-{"col_1":{"label":"Qualified"},"col_2":"text value","col_3":{"date":"2024-01-15"}}
-
-The column_values parameter is a JSON-ENCODED STRING. Double-escape quotes with \\\\ in the GraphQL query.
-
-═══════════════════════════════════════════════════════════════
-NATURAL LANGUAGE → OPERATION MAP
-═══════════════════════════════════════════════════════════════
-
-SALES PIPELINE (${SB}):
-"show all leads"                        → GET ALL ITEMS
-"how many leads"                        → BOARD STATS
-"new inquiries" / "show new"            → GET ALL → filter Pipeline Stage = New Inquiry
-"qualified leads"                       → GET ALL → filter Pipeline Stage = Qualified
-"find [name]"                           → SEARCH BY NAME
-"qualify [name]"                        → SEARCH → UPDATE Pipeline Stage "Qualified"
-"mark [name] contacted"                → SEARCH → UPDATE Pipeline Stage "Contacted"
-"proposal sent to [name]"              → SEARCH → UPDATE Pipeline Stage "Proposal Sent" + note
-"deal won [name]"                      → SEARCH → UPDATE Pipeline Stage "Deal Won"
-"deal lost [name]"                     → SEARCH → UPDATE Pipeline Stage "Deal Lost"
-"add lead [name] [phone] [source]"     → CREATE ITEM with columns
-"delete [name]" / "remove [name]"      → SEARCH → DELETE
-"archive [name]"                       → SEARCH → ARCHIVE
-"add note to [name]: [text]"           → SEARCH → ADD NOTE
-"assign [name] to [AE]"               → SEARCH → UPDATE Assigned AE
-"set follow-up [name] to [date]"       → SEARCH → UPDATE Next Follow-Up
-"remove [person] from managing [name]" → SEARCH → CLEAR Assigned AE field
-"who needs follow up"                  → GET ALL → analyze follow-up dates
-"pipeline summary"                     → GET ALL → count by Pipeline Stage
-"last 10 leads"                        → GET RECENT ITEMS
-
-ARTIST DATABASE (${AB}):
-"show all artists"                     → GET ALL ITEMS
-"available artists"                    → GET ALL → filter Availability = Available
-"show DJs / dancers / vocalists"       → GET ALL → filter Art Form
-"add artist [name]"                    → CREATE ITEM
-"book [name]"                          → SEARCH → UPDATE Availability "Booked"
-"rate [name] top rated"                → SEARCH → UPDATE Rating "Top Rated"
-"set pricing [name] to [amount]"       → SEARCH → UPDATE Pricing AED/Event
-"shortlist [name]"                     → SEARCH → UPDATE Pipeline Stage "Shortlisted"
-"contract signed [name]"              → SEARCH → UPDATE Contract Status "Signed"
-"artist summary"                       → GET ALL → count by Pipeline Stage + Availability
-
-STAFF DATABASE (${TB}):
-"show team" / "show staff"             → GET ALL ITEMS
-"active staff"                         → GET ALL → filter Status = Active
-"add staff [name]"                     → CREATE ITEM
-"promote [name] to manager"            → GET ALL staff → system finds ID → UPDATE Access Level "Manager"
-"put [name] on leave"                  → GET ALL staff → system finds ID → UPDATE Status "On Leave"
-"deactivate [name]"                    → GET ALL staff → system finds ID → UPDATE Status "Inactive"
-"assign [name] to sales"              → GET ALL staff → system finds ID → UPDATE Assigned Pipeline "Sales"
-"team overview"                        → GET ALL → count by Status + Access Level
-"tasks for [name]"                     → GET ALL staff items (system filters by person name in column values)
-"what is [name] working on"            → GET ALL staff items (system filters by person name)
-"[name]'s tasks"                       → GET ALL staff items (system filters by person name)
-"clients assigned to [name]"           → GET ALL items from SALES board (system filters by Assigned AE column matching [name])
-
-CROSS-BOARD:
-"full report" / "summary"             → Stats from all 3 boards
-"find [name]" (no context)            → Search all 3 boards
-"what happened today"                  → Recent items across all boards
-
-═══════════════════════════════════════════════════════════════
-RESPONSE FORMATTING RULES
-═══════════════════════════════════════════════════════════════
-
-LARGE DATASETS (>10 items):
-- Show count first: "You have 29 leads"
-- Offer breakdown: "Want to see by status? Or filter by AE?"
-- If user insists on "all", show first 10 and offer "next 10"
-- Use concise format: "Name | Phone | Status"
-
-SMALL DATASETS (≤10 items):
-- Show all items with key details
-- Format clearly with bullet points
-- Include relevant fields only
-
-SINGLE ITEM:
-- Show all details
-- Include recent notes/updates
-- Suggest next actions
-
-EXAMPLE - Large Dataset:
-User: "show all leads"
-Response: "You have 29 leads in Sales Pipeline:
-• 12 New Inquiries
-• 8 Contacted  
-• 5 Qualified
-• 3 Proposal Sent
-• 1 Deal Won
-
-Want to see a specific stage? Or show me the first 10?"
-
-EXAMPLE - User insists on all:
-User: "show me all"
-Response: "First 10 leads:
-1. Kabir Malhotra | +971501234567 | New Inquiry
-2. Priya Nair | +971502345678 | Contacted
-...
-10. John Smith | +971509876543 | Qualified
-
-Reply 'next' for more, or filter by status."
-
-═══════════════════════════════════════════════════════════════
-RESPONSE FORMAT — ABSOLUTE RULES
-═══════════════════════════════════════════════════════════════
-
-Return ONLY valid JSON. No markdown. No backticks.
-
-{
-  "message": "",
-  "needs_data": true,
-  "queries": ["query { boards(ids: [${SB}]) { items_page(limit: 100) { items { id name column_values { id text } } } } }"],
-  "action_type": "read",
-  "follow_up": ""
-}
-
-██ MESSAGE FIELD RULES ██
-
-FOR READ OPERATIONS (show, list, get, find, how many, which, available, charge, price):
-✅ CORRECT: message: ""
-✅ CORRECT: message: "Fetching"
-❌ FORBIDDEN: message: "Found 20 items. Showing first 10:"
-❌ FORBIDDEN: message: "1. Priya Nair | Phone: +971..."
-❌ FORBIDDEN: message: "Here are your artists:"
-❌ FORBIDDEN: Any list, any data, any count, any formatting
-
-FOR WRITE OPERATIONS (create, update, delete, assign, mark, set):
-✅ CORRECT: message: "Updating"
-✅ CORRECT: message: "Creating"
-✅ CORRECT: message: "Deleting"
-❌ FORBIDDEN: message: "Done. Priya has been marked as contacted."
-❌ FORBIDDEN: message: "Successfully updated 3 records"
-❌ FORBIDDEN: Any confirmation with details
-
-FOR QUESTIONS (truly ambiguous, need clarification):
-✅ CORRECT: message: "Which board - Sales, Artists, or Staff?"
-✅ CORRECT: message: "Multiple matches found. Which Priya - Priya Nair or Priya Shah?"
-
-██ QUERIES FIELD RULES ██
-
-EVERY data request MUST have queries[]:
-- "show all artists" → queries: ["query { boards(ids: [${AB}]) { items_page(limit: 100) { items { id name column_values { id text } } } } }"]
-- "how many leads" → queries: ["query { boards(ids: [${SB}]) { items_page(limit: 100) { items { id } } } }"]
-- "find Priya" → queries: ["query { boards(ids: [${AB}]) { items_page(query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"priya\\"], operator: contains_text}]}) { items { id name column_values { id text } } } } }"]
-
-NEVER return empty queries[] for data requests.
-
-██ FIELD DEFINITIONS ██
-
-- "message": For reads: "" or "Fetching" (1 word max). For writes: "Updating" (1 word max). For questions: actual question.
-- "needs_data": true when queries[] is non-empty. false only for pure chat.
-- "queries": Array of REAL GraphQL. Use actual board IDs and column_ids from schema.
-- "action_type": "read" | "write" | "question" | "chat"
-- "follow_up": Internal note or ""
-
-██ EXAMPLES ██
-
-User: "show all artists"
-Response:
-{
-  "message": "",
-  "needs_data": true,
-  "queries": ["query { boards(ids: [${AB}]) { items_page(limit: 100) { items { id name column_values { id text value type } } } } }"],
-  "action_type": "read",
-  "follow_up": ""
-}
-
-User: "mark Priya as contacted"
-Response:
-{
-  "message": "Updating",
-  "needs_data": true,
-  "queries": [
-    "query { boards(ids: [${SB}]) { items_page(query_params: {rules: [{column_id: \\"name\\", compare_value: [\\"priya\\"], operator: contains_text}]}) { items { id name } } } }",
-    "mutation { change_multiple_column_values(board_id: ${SB}, item_id: ITEM_ID_PLACEHOLDER, column_values: \\"{\\\\\\"status_col_id\\\\\\":{\\\\\\"label\\\\\\":\\\\\\"Contacted\\\\\\"}}\\" ) { id } }"
-  ],
-  "action_type": "write",
-  "follow_up": ""
-}
-
-User: "hello"
-Response:
-{
-  "message": "Ready to assist.",
-  "needs_data": false,
-  "queries": [],
-  "action_type": "chat",
-  "follow_up": ""
-}
-
-═══════════════════════════════════════════════════════════════
-FINAL WARNING
-═══════════════════════════════════════════════════════════════
-
-YOU ARE A QUERY GENERATOR. NOT A DATA FORMATTER.
-The system formats data AFTER you respond.
-Your job: Generate queries. Nothing else.
-
-If you write formatted data in message field, the system BREAKS.
-If you write counts in message field, the system BREAKS.
-If you write lists in message field, the system BREAKS.
-
-Keep message field EMPTY for reads. Let the system format.
-
-You are Sourabh's query engine. Generate queries. Execute with precision.`;
-}
-
-// ============================================================
-// GEMINI AI - PRODUCTION GRADE
-// ============================================================
-
-function normalizeAIResponse(raw) {
-  // Map old field names to new ones (Gemini sometimes uses either format)
-  const message = raw.message || raw.human_response || '';
-  const queries = raw.queries || raw.graphql_queries || [];
-  const needsData = raw.needs_data !== undefined ? raw.needs_data : (raw.requires_monday_action || false);
-  const actionType = raw.action_type || raw.operation_type || 'chat';
-  const followUp = raw.follow_up || raw.followup_action || '';
-
-  // Map old operation_type values to expected action_type values
-  const actionTypeMap = {
-    'create': 'write',
-    'update': 'write',
-    'delete': 'write',
-    'intelligence': 'chat',
-  };
-
-  return {
-    message,
-    needs_data: needsData || (queries.length > 0),
-    queries: Array.isArray(queries) ? queries : [],
-    action_type: actionTypeMap[actionType] || actionType,
-    follow_up: followUp,
-  };
-}
-
-// P1-2 FIX: Removed dead callGemini function (130 lines)
-// P1-3 FIX: Removed conversationHistory management (handled by memory.js)
-// P1-4 FIX: Removed queryCache (never used)
+// NOTE: System prompt is loaded from ARIA_SYSTEM_PROMPT.md via lib/aria-chain.js
+// The inline buildSystemPrompt was removed — it was dead code from pre-LangChain architecture.
 
 // ============================================================
 // MONDAY.COM - RELIABLE EXECUTION
 // ============================================================
 
-async function mondayQuery(query) {
+/*
+ * DEAD CODE REMOVED: ~450 lines of inline buildSystemPrompt(), normalizeAIResponse(), and old comments.
+ * System prompt is now loaded from ARIA_SYSTEM_PROMPT.md via lib/aria-chain.js.
+ * AI response normalization is handled by lib/output-parser.js.
+ */
+
+async function mondayQuery(query, _retryCount = 0) {
+  const MAX_RETRIES = 3;
   try {
     const response = await axios.post(
       CONFIG.monday.apiBase,
@@ -647,22 +137,23 @@ async function mondayQuery(query) {
         timeout: 20000,
       }
     );
-    
+
     if (response.data.errors) {
       logger.error('Monday.com errors', { errors: response.data.errors });
       return { error: response.data.errors[0]?.message || 'API error' };
     }
-    
+
     return response.data.data;
-    
+
   } catch (error) {
-    if (error.response?.status === 429) {
-      logger.warn('Rate limited, retrying...');
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      return mondayQuery(query);
+    if (error.response?.status === 429 && _retryCount < MAX_RETRIES) {
+      const delay = 5000 * (_retryCount + 1);
+      logger.warn(`Rate limited, retry ${_retryCount + 1}/${MAX_RETRIES} after ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return mondayQuery(query, _retryCount + 1);
     }
-    
-    logger.error('Monday.com error', { error: error.message });
+
+    logger.error('Monday.com error', { error: error.message, retries: _retryCount });
     return { error: error.message };
   }
 }
@@ -803,8 +294,40 @@ async function processMessage(chatId, messageText) {
     return;
   }
 
+  // Step 1b: Programmatic follow-up context merging
+  // If agent detected follow_up intent, merge previous filters with new ones
+  if (agentOutput.intent === 'follow_up' && agentOutput.action_type === 'read') {
+    const lastContext = getLastContext(chatId);
+    if (lastContext) {
+      // Inherit board from previous context if current is unknown
+      if ((!agentOutput.entities.board || agentOutput.entities.board === 'unknown') && lastContext.board) {
+        agentOutput.entities.board = lastContext.board;
+        logger.info('Follow-up: inherited board from context', { board: lastContext.board });
+      }
+
+      // Merge previous filters with new filters (deduplicate by field)
+      if (lastContext.filters && lastContext.filters.length > 0) {
+        const currentFields = new Set((agentOutput.entities.filters || []).map(f => f.field));
+        const mergedFilters = [...(agentOutput.entities.filters || [])];
+        for (const prevFilter of lastContext.filters) {
+          if (!currentFields.has(prevFilter.field)) {
+            mergedFilters.push(prevFilter);
+            logger.info('Follow-up: merged previous filter', { field: prevFilter.field, value: prevFilter.value });
+          }
+        }
+        agentOutput.entities.filters = mergedFilters;
+      }
+
+      // Inherit person_name if not set in current query
+      if (!agentOutput.entities.person_name && lastContext.person_name) {
+        agentOutput.entities.person_name = lastContext.person_name;
+        logger.info('Follow-up: inherited person_name from context', { person_name: lastContext.person_name });
+      }
+    }
+  }
+
   // Step 2: Handle based on action type
-  
+
   // CHAT / GREETING / QUESTION - No data needed
   if (agentOutput.action_type === 'chat' || agentOutput.action_type === 'question') {
     await sendTelegramMessage(chatId, agentOutput.message);
@@ -827,6 +350,18 @@ async function processMessage(chatId, messageText) {
       queriesExecuted: 0,
     });
     return;
+  }
+
+  // P1-4 FIX: Block critically invalid outputs from reaching execution
+  if (agentOutput._validation_failed) {
+    const critical = (agentOutput._validation_reasons || []).some(r => r.includes('CRITICAL'));
+    if (critical) {
+      logger.error('Blocked critically invalid agent output from execution', {
+        reasons: agentOutput._validation_reasons,
+      });
+      await sendTelegramMessage(chatId, "I had trouble understanding that. Can you be more specific about what you need?");
+      return;
+    }
   }
 
   // READ / WRITE - Execute queries
@@ -863,7 +398,15 @@ async function processMessage(chatId, messageText) {
   }
 
   // Step 4: Translate semantic column names to real Monday.com column IDs
+  //         and fix group_id references
   const resolvedQueries = resolveQueryPlaceholders(agentOutput.queries).map(query => {
+    // P0-3 FIX: Replace "topics" or any wrong group_id with real group ID for the target board
+    if (query.includes('group_id')) {
+      const board = agentOutput.entities?.board || 'sales';
+      const realGroupId = boardGroups[board] || boardGroups.sales;
+      query = query.replace(/group_id:\s*\\"topics\\"/g, `group_id: \\"${realGroupId}\\"`);
+      query = query.replace(/group_id:\s*"topics"/g, `group_id: "${realGroupId}"`);
+    }
     // If this is a mutation with column_values, translate semantic fields to real IDs
     if (query.includes('column_values') && agentOutput.entities?.board) {
       return translateMutationQuery(query, agentOutput.entities.board);
@@ -1151,9 +694,9 @@ function formatReadResultsWithFilters(results, originalRequest, entities) {
     return 'No items found.';
   }
 
-  // Apply agent-extracted filters
+  // Apply agent-extracted filters (pass board for column-mapper resolution)
   for (const filter of entities.filters) {
-    items = applyAgentFilter(items, filter);
+    items = applyAgentFilter(items, filter, entities.board);
   }
 
   // Apply person name filter if provided
@@ -1189,69 +732,72 @@ function formatReadResultsWithFilters(results, originalRequest, entities) {
     header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found:\n\n`;
   }
 
-  return header + itemStrings.join('\n\n');
+  return chunkItemsForTelegram(header, itemStrings);
+}
+
+// Chunk formatted items for Telegram's 4096 char limit (return first chunk)
+function chunkItemsForTelegram(header, itemStrings) {
+  const chunks = [];
+  let currentChunk = header;
+
+  for (const itemStr of itemStrings) {
+    if ((currentChunk + itemStr + '\n\n').length > 3800) {
+      chunks.push(currentChunk.trim());
+      currentChunk = itemStr + '\n\n';
+    } else {
+      currentChunk += itemStr + '\n\n';
+    }
+  }
+
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
+  }
+
+  return chunks[0] || 'No data to display.';
 }
 
 // Apply a single agent-extracted filter to items
-function applyAgentFilter(items, filter) {
+// P1-5 FIX: Use column-mapper IDs first, title matching as fallback
+function applyAgentFilter(items, filter, board) {
   return items.filter(item => {
     const columns = item.column_values || [];
-    
-    // Find column matching filter field
+
+    // Strategy 1: Use column-mapper to find exact column ID
     let targetCol = null;
-    
-    if (filter.field === 'experience' || filter.field.includes('year')) {
-      targetCol = columns.find(col => {
-        const title = getColumnTitle(col.id).toLowerCase();
-        return title.includes('experience') || title.includes('years');
-      });
-    } else if (filter.field === 'pricing' || filter.field === 'price') {
-      targetCol = columns.find(col => {
-        const title = getColumnTitle(col.id).toLowerCase();
-        return title.includes('pricing') || title.includes('price') || title.includes('charge');
-      });
-    } else if (filter.field === 'art_form' || filter.field === 'artform') {
-      targetCol = columns.find(col => {
-        const title = getColumnTitle(col.id).toLowerCase();
-        return title.includes('art') && title.includes('form');
-      });
-    } else if (filter.field === 'availability') {
-      targetCol = columns.find(col => {
-        const title = getColumnTitle(col.id).toLowerCase();
-        return title.includes('availability');
-      });
-    } else if (filter.field === 'status' || filter.field.includes('stage')) {
-      targetCol = columns.find(col => {
-        const title = getColumnTitle(col.id).toLowerCase();
-        return title.includes('status') || title.includes('stage') || title.includes('pipeline');
-      });
-    } else {
-      // Generic field match
+    const mappedColId = getColumnId(board, filter.field);
+    if (mappedColId) {
+      targetCol = columns.find(col => col.id === mappedColId);
+    }
+
+    // Strategy 2: Fallback to title matching if mapper didn't resolve
+    if (!targetCol) {
       targetCol = columns.find(col => {
         const title = getColumnTitle(col.id).toLowerCase();
         return title.includes(filter.field.toLowerCase());
       });
     }
-    
+
     if (!targetCol || !targetCol.text) return false;
-    
+
     const colValue = targetCol.text.toLowerCase();
     const filterValue = filter.value.toLowerCase();
-    
+
     // Apply operator
     switch (filter.operator) {
       case 'equals':
-        return colValue === filterValue;
+        // Fuzzy equals: exact match or substring containment
+        return colValue === filterValue || colValue.includes(filterValue) || filterValue.includes(colValue);
       case 'contains':
         return colValue.includes(filterValue);
       case 'greater_than':
       case 'greater_equal':
       case 'less_than':
       case 'less_equal': {
-        const numMatch = targetCol.text.match(/(\d+)/);
+        const numMatch = targetCol.text.match(/[\d,]+\.?\d*/);
         if (!numMatch) return false;
-        const itemValue = parseInt(numMatch[1]);
-        const targetValue = parseInt(filter.value);
+        const itemValue = parseFloat(numMatch[0].replace(/,/g, ''));
+        const targetValue = parseFloat(filter.value.replace(/,/g, ''));
+        if (isNaN(itemValue) || isNaN(targetValue)) return false;
         if (filter.operator === 'greater_than') return itemValue > targetValue;
         if (filter.operator === 'greater_equal') return itemValue >= targetValue;
         if (filter.operator === 'less_than') return itemValue < targetValue;
@@ -1259,7 +805,7 @@ function applyAgentFilter(items, filter) {
         return false;
       }
       case 'not_equals':
-        return colValue !== filterValue;
+        return colValue !== filterValue && !colValue.includes(filterValue);
       default:
         return true;
     }
@@ -1314,25 +860,7 @@ function formatReadResults(results, originalRequest) {
     header = `${totalCount} ${boardName ? boardName.replace(' Database', '').toLowerCase() + 's' : 'items'} found:\n\n`;
   }
 
-  // Chunk messages at item boundaries (max 3800 chars per message)
-  const chunks = [];
-  let currentChunk = header;
-  
-  for (const itemStr of itemStrings) {
-    if ((currentChunk + itemStr + '\n\n').length > 3800) {
-      chunks.push(currentChunk.trim());
-      currentChunk = itemStr + '\n\n';
-    } else {
-      currentChunk += itemStr + '\n\n';
-    }
-  }
-  
-  if (currentChunk.trim()) {
-    chunks.push(currentChunk.trim());
-  }
-
-  // Return first chunk (for now, multi-chunk support can be added later)
-  return chunks[0] || 'No data to display.';
+  return chunkItemsForTelegram(header, itemStrings);
 }
 
 // Helper to get column title from ID
@@ -1546,29 +1074,9 @@ app.get('/health', (req, res) => {
 async function fetchBoardColumns() {
   for (const [key, board] of Object.entries(CONFIG.monday.boards)) {
     try {
-      const query = `query { boards(ids: [${board.id}]) { columns { id title type } } }`;
-      const result = await mondayQuery(query);
-      if (result?.boards?.[0]?.columns) {
-        boardColumns[key] = result.boards[0].columns;
-        logger.info(`Fetched ${boardColumns[key].length} columns for ${board.name}`);
-      }
-    } catch (error) {
-      logger.error(`Failed to fetch columns for ${board.name}`, { error: error.message });
-    }
-  }
-  
-  // Build semantic column mappings after fetching schemas
-  buildColumnMappings(boardColumns);
-  logger.info('Column mappings built for semantic field translation');
-}
-
-async function fetchBoardColumns() {
-  for (const [key, board] of Object.entries(CONFIG.monday.boards)) {
-    try {
       // Fetch both columns and groups
       const query = `query { boards(ids: [${board.id}]) { columns { id title type } groups { id title } } }`;
       const result = await mondayQuery(query);
-    logger.info("After mondayQuery wait", { resultPreview: JSON.stringify(result).substring(0,100) });
       if (result?.boards?.[0]?.columns) {
         boardColumns[key] = result.boards[0].columns;
         logger.info(`Fetched ${boardColumns[key].length} columns for ${board.name}`);
@@ -1582,6 +1090,10 @@ async function fetchBoardColumns() {
       logger.error(`Failed to fetch columns for ${board.name}`, { error: error.message });
     }
   }
+
+  // Build semantic column mappings after fetching schemas
+  buildColumnMappings(boardColumns);
+  logger.info('Column mappings built for semantic field translation');
 }
 
 function formatColumnsForPrompt(key) {
@@ -1637,6 +1149,7 @@ app.listen(PORT, async () => {
       salesColumns: boardColumns.sales,
       artistsColumns: boardColumns.artists,
       staffColumns: boardColumns.staff,
+      boardGroups: boardGroups,
     });
     logger.info('LangChain ARIA chain initialized successfully');
   } catch (err) {

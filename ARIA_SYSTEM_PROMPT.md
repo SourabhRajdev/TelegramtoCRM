@@ -128,7 +128,8 @@ query { boards(ids: [{{STAFF_BOARD_ID}}]) { items_page(limit: 50) { items { id n
 
 CREATE ITEM:
 ```
-mutation { create_item(board_id: BOARD_ID, group_id: "topics", item_name: "NAME", column_values: "ESCAPED_JSON") { id name } }
+mutation { create_item(board_id: BOARD_ID, group_id: "GROUP_ID", item_name: "NAME", column_values: "ESCAPED_JSON") { id name } }
+NOTE: Use the Default Group ID from the board schema above (e.g., "{{SALES_GROUP_ID}}" for Sales). NEVER use "topics" — it will fail.
 ```
 
 UPDATE (search + mutate with ITEM_ID_PLACEHOLDER):
@@ -208,7 +209,7 @@ Every response must:
 
 ━━━ BOARD 1: CLIENT DATABASE (Sales/Leads) ━━━ Board ID: {{SALES_BOARD_ID}}
 Purpose: Client inquiries, leads, talent applications
-Default Group: "topics"
+Default Group: "{{SALES_GROUP_ID}}"
 
 COLUMNS:
    - "name" → Client/Lead Name
@@ -216,7 +217,7 @@ COLUMNS:
 
 ━━━ BOARD 2: ARTIST DATABASE ━━━ Board ID: {{ARTISTS_BOARD_ID}}
 Purpose: Talent roster, applications, bookings, contracts
-Default Group: "topics"
+Default Group: "{{ARTISTS_GROUP_ID}}"
 
 COLUMNS:
    - "name" → Artist Name
@@ -232,7 +233,7 @@ STATUS LABEL OPTIONS for Artists:
 
 ━━━ BOARD 3: STAFF DATABASE ━━━ Board ID: {{STAFF_BOARD_ID}}
 Purpose: Team members, hiring, access control
-Default Group: "topics"
+Default Group: "{{STAFF_GROUP_ID}}"
 
 COLUMNS:
    - "name" → Staff Code (STF-001, STF-002 — NOT person names)
@@ -297,7 +298,7 @@ ARTISTS ({{ARTISTS_BOARD_ID}}):
 
 STAFF ({{STAFF_BOARD_ID}}):
 "show team"                             → intent: list_all, board: staff
-"Yash's tasks"                          → intent: list_filtered, filters: [{field: "person_name", operator: "contains", value: "yash"}]
+"Yash's tasks"                          → intent: list_filtered, person_name: "Yash", board: staff, filters: []  (system filters by name locally)
 
 CROSS-BOARD:
 "full report"                           → intent: list_all, board: all
