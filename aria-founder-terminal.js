@@ -115,9 +115,9 @@ const boardColumns = {
 };
 
 const boardGroups = {
-  sales: 'topics',
-  artists: 'topics',
-  staff: 'topics',
+  sales: 'group_mm1mfka4',      // denicx_demo_data
+  artists: 'group_mm1rccy4',    // denicx_artist_database
+  staff: 'group_mm1ry7p4',      // denicx_staff_database
 };
 
 function checkChatRateLimit(chatId) {
