@@ -964,8 +964,8 @@ function itemMatchesPerson(item, personName) {
 
 // Format read results with agent context (NEW - uses agent's extracted entities)
 function formatReadResultsWithContext(results, originalRequest, entities) {
-  // Use agent's extracted filters instead of regex parsing
-  if (entities && entities.filters && entities.filters.length > 0) {
+  // Use agent's extracted filters OR person_name
+  if (entities && (entities.filters?.length > 0 || entities.person_name)) {
     return formatReadResultsWithFilters(results, originalRequest, entities);
   }
   
@@ -1013,8 +1013,17 @@ function formatReadResultsWithFilters(results, originalRequest, entities) {
   }
 
   if (items.length === 0) {
-    const filterDesc = entities.filters.map(f => `${f.field} ${f.operator} ${f.value}`).join(', ');
-    return `No items found matching filters: ${filterDesc}`;
+    const parts = [];
+    if (entities.person_name) {
+      parts.push(`person: ${entities.person_name}`);
+    }
+    if (entities.filters && entities.filters.length > 0) {
+      const filterDesc = entities.filters.map(f => `${f.field} ${f.operator} ${f.value}`).join(', ');
+      parts.push(filterDesc);
+    }
+    return parts.length > 0 
+      ? `No items found matching: ${parts.join(' | ')}`
+      : 'No items found.';
   }
 
   // Format results
