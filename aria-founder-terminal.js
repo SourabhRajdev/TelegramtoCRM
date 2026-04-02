@@ -81,11 +81,6 @@ const chatRateLimits = new Map();
 // Stores pending write operations awaiting user confirmation
 const pendingWrites = new Map(); // chatId → agentOutput
 
-// ── Group Chat TTL Buffer ───────────────────────────────────
-// Accumulates group chat messages and fires after 90s of silence
-const pendingMessages = new Map(); // chatId → { texts: string[], timer: NodeJS.Timeout }
-const GROUP_CHAT_TTL_MS = 90_000;
-
 function isConfirmation(text) {
   return /^(yes|yeah|yep|ok|okay|sure|do it|confirm|proceed|go ahead|yup|correct|right|absolutely|sounds good|done)[\s!.?]*$/i.test(text.trim());
 }
@@ -94,16 +89,6 @@ function isCancellation(text) {
   return /^(no|nope|cancel|nevermind|never mind|stop|don't|dont|skip|forget it|abort)[\s!.?]*$/i.test(text.trim());
 }
 
-function isGroupChat(chatId) {
-  return chatId < 0; // Telegram group/supergroup IDs are negative
-}
-
-function hasDirectIntent(text) {
-  // Immediate response triggers — unambiguous data or write commands
-  return /\b(aria)\b/i.test(text) ||
-    /\b(show|find|list|add|update|delete|create|mark|how many|tell me|give me|get me|count)\b.{0,40}\b(lead|client|artist|staff|dj|sales|team|deal|prospect)\b/i.test(text) ||
-    /\b(lead|client|artist|staff|dj|sales|team|deal)\b.{0,40}\b(show|find|list|update|delete|mark|create)\b/i.test(text);
-}
 
 // Store board column schemas and groups fetched at startup
 const boardColumns = {
@@ -484,17 +469,20 @@ async function processMessage(chatId, messageText, savedAgentOutput = null) {
     return;
   }
 
-  // Step 3: Check for duplicate operations (write safety)
+  // Step 3: Check for duplicate operations (write safety — 45s dedup window)
   if (agentOutput.action_type === 'write') {
     const operationId = generateOperationId(
       agentOutput.intent,
       agentOutput.entities,
       agentOutput.action_type
     );
-    
-    if (isOperationExecuted(operationId)) {
+
+    // Explicit retry signals override the dedup check
+    const isExplicitRetry = /\b(again|retry|redo|once more|do it again|re-?assign|re-?update|repeat)\b/i.test(messageText);
+
+    if (!isExplicitRetry && isOperationExecuted(operationId)) {
       logger.warn('Duplicate operation detected - skipping execution', { operationId, intent: agentOutput.intent });
-      await sendTelegramMessage(chatId, "I already executed that operation recently. If you want to do it again, please wait a moment or rephrase.");
+      await sendTelegramMessage(chatId, "Done already — same operation ran just now. Say \"again\" if you want to repeat it.");
       return;
     }
     
@@ -1158,56 +1146,6 @@ function resolveQueryPlaceholders(queries) {
 }
 
 // ============================================================
-// GROUP CHAT TTL ROUTER
-// ============================================================
-
-async function handleIncomingMessage(chatId, text) {
-  // Private chats always respond immediately
-  if (!isGroupChat(chatId)) {
-    await processMessage(chatId, text);
-    return;
-  }
-
-  // Group chats: respond immediately if directly addressed or clear data intent
-  if (hasDirectIntent(text)) {
-    // Flush any accumulated context along with this message
-    const pending = pendingMessages.get(chatId);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pendingMessages.delete(chatId);
-      const fullContext = pending.texts.length > 0
-        ? pending.texts.join('\n') + '\n' + text
-        : text;
-      await processMessage(chatId, fullContext);
-    } else {
-      await processMessage(chatId, text);
-    }
-    return;
-  }
-
-  // Accumulate and start/reset the TTL timer
-  if (!pendingMessages.has(chatId)) {
-    pendingMessages.set(chatId, { texts: [], timer: null });
-  }
-  const pending = pendingMessages.get(chatId);
-  pending.texts.push(text);
-
-  if (pending.timer) clearTimeout(pending.timer);
-  pending.timer = setTimeout(async () => {
-    const accumulated = pending.texts.join('\n');
-    pendingMessages.delete(chatId);
-    if (accumulated.trim()) {
-      logger.info('Group chat TTL fired — processing accumulated context', { chatId, lines: pending.texts.length });
-      await processMessage(chatId, accumulated).catch(err =>
-        logger.error('TTL-triggered processing failed', { error: err.message })
-      );
-    }
-  }, GROUP_CHAT_TTL_MS);
-
-  logger.info('Group chat message buffered', { chatId, buffered: pending.texts.length });
-}
-
-// ============================================================
 // WEBHOOK & ROUTES
 // ============================================================
 
@@ -1250,8 +1188,7 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
       return;
     }
     
-    // Process message — route through group chat TTL buffer if needed
-    await handleIncomingMessage(chatId, text);
+    await processMessage(chatId, text);
     
   } catch (error) {
     logger.error('Webhook error', { error: error.message, stack: error.stack });
@@ -1389,4 +1326,4 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-module.exports = { app, CONFIG };
+module.exports = { app, CONFIG, applyAgentFilter };
