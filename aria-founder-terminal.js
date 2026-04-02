@@ -255,6 +255,13 @@ async function sendTypingIndicator(chatId) {
   }
 }
 
+// Keep typing indicator alive for long operations (Telegram expires it after 5s)
+function startTypingIndicator(chatId) {
+  sendTypingIndicator(chatId);
+  const interval = setInterval(() => sendTypingIndicator(chatId), 4000);
+  return () => clearInterval(interval);
+}
+
 // ============================================================
 // MAIN MESSAGE PROCESSOR - AGENT-AWARE
 // ============================================================
@@ -275,8 +282,9 @@ async function processMessage(chatId, messageText) {
     return;
   }
 
-  // Show typing
-  await sendTypingIndicator(chatId);
+  // Show typing — keep alive until response is ready (Telegram expires after 5s)
+  const stopTyping = startTypingIndicator(chatId);
+  try {
 
   // Step 1: Invoke ARIA agent (with new decision protocol)
   let agentOutput;
@@ -596,6 +604,9 @@ async function processMessage(chatId, messageText) {
     message: messageText,
     queriesExecuted: allResults.length,
   });
+  } finally {
+    stopTyping();
+  }
 }
 
 // Translate mutation query with semantic column names to real Monday.com column IDs
