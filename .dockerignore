@@ -7,6 +7,7 @@ data
 !ARIA_SYSTEM_PROMPT.md
 !ARIA_SYSTEM_INTELLIGENCE.md
 !ARIA_v6_System_Prompt.md
+!ARIA_v7_System_Prompt.md
 test
 coverage
 .github

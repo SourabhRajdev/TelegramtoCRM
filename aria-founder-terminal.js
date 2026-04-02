@@ -77,6 +77,34 @@ const CONFIG = {
 
 const chatRateLimits = new Map();
 
+// ── Write Confirmation State ────────────────────────────────
+// Stores pending write operations awaiting user confirmation
+const pendingWrites = new Map(); // chatId → agentOutput
+
+// ── Group Chat TTL Buffer ───────────────────────────────────
+// Accumulates group chat messages and fires after 90s of silence
+const pendingMessages = new Map(); // chatId → { texts: string[], timer: NodeJS.Timeout }
+const GROUP_CHAT_TTL_MS = 90_000;
+
+function isConfirmation(text) {
+  return /^(yes|yeah|yep|ok|okay|sure|do it|confirm|proceed|go ahead|yup|correct|right|absolutely|sounds good|done)[\s!.?]*$/i.test(text.trim());
+}
+
+function isCancellation(text) {
+  return /^(no|nope|cancel|nevermind|never mind|stop|don't|dont|skip|forget it|abort)[\s!.?]*$/i.test(text.trim());
+}
+
+function isGroupChat(chatId) {
+  return chatId < 0; // Telegram group/supergroup IDs are negative
+}
+
+function hasDirectIntent(text) {
+  // Immediate response triggers — unambiguous data or write commands
+  return /\b(aria)\b/i.test(text) ||
+    /\b(show|find|list|add|update|delete|create|mark|how many|tell me|give me|get me|count)\b.{0,40}\b(lead|client|artist|staff|dj|sales|team|deal|prospect)\b/i.test(text) ||
+    /\b(lead|client|artist|staff|dj|sales|team|deal)\b.{0,40}\b(show|find|list|update|delete|mark|create)\b/i.test(text);
+}
+
 // Store board column schemas and groups fetched at startup
 const boardColumns = {
   sales: [],
@@ -266,7 +294,7 @@ function startTypingIndicator(chatId) {
 // MAIN MESSAGE PROCESSOR - AGENT-AWARE
 // ============================================================
 
-async function processMessage(chatId, messageText) {
+async function processMessage(chatId, messageText, savedAgentOutput = null) {
   logger.info('Message received', { chatId, message: messageText });
 
   // Security check
@@ -282,14 +310,36 @@ async function processMessage(chatId, messageText) {
     return;
   }
 
+  // ── Write Confirmation Gate ─────────────────────────────
+  // Check if this message is a response to a pending write confirmation
+  const pendingWrite = pendingWrites.get(chatId);
+  if (pendingWrite) {
+    if (isCancellation(messageText)) {
+      pendingWrites.delete(chatId);
+      await sendTelegramMessage(chatId, 'Cancelled.');
+      return;
+    }
+    if (isConfirmation(messageText)) {
+      pendingWrites.delete(chatId);
+      logger.info('Write confirmed — executing pending operation', { intent: pendingWrite.intent });
+      return processMessage(chatId, messageText, { ...pendingWrite, awaiting_confirmation: false });
+    }
+    // Not a clear yes/no — treat as new message (drop the pending write)
+    pendingWrites.delete(chatId);
+  }
+
   // Show typing — keep alive until response is ready (Telegram expires after 5s)
   const stopTyping = startTypingIndicator(chatId);
   try {
 
-  // Step 1: Invoke ARIA agent (with new decision protocol)
+  // Step 1: Invoke ARIA agent (unless savedAgentOutput provided — confirmed write path)
   let agentOutput;
+  if (savedAgentOutput) {
+    agentOutput = savedAgentOutput;
+    logger.info('Using saved agent output (confirmed write)', { intent: agentOutput.intent });
+  }
   try {
-    agentOutput = await callAriaChain(chatId, messageText);
+    if (!savedAgentOutput) agentOutput = await callAriaChain(chatId, messageText);
     logger.info('Agent response received', {
       intent: agentOutput.intent,
       board: agentOutput.entities?.board,
@@ -377,10 +427,18 @@ async function processMessage(chatId, messageText) {
     }
   }
 
+  // Step 1d: Write confirmation gate — if agent says awaiting_confirmation, hold and ask
+  if (agentOutput.awaiting_confirmation === true) {
+    pendingWrites.set(chatId, agentOutput);
+    logger.info('Write pending confirmation', { intent: agentOutput.intent, person: agentOutput.entities?.person_name });
+    await sendTelegramMessage(chatId, agentOutput.message);
+    return;
+  }
+
   // Step 2: Handle based on action type
 
   // CHAT / GREETING / QUESTION / NONE - No data needed
-  // v6 uses action_type 'none' for greetings/clarifications; keep 'chat'/'question' for backward compat
+  // v7 uses action_type 'none' for greetings/clarifications; keep 'chat'/'question' for backward compat
   if (agentOutput.action_type === 'none' || agentOutput.action_type === 'chat' || agentOutput.action_type === 'question') {
     await sendTelegramMessage(chatId, agentOutput.message);
     logAudit({
@@ -1100,6 +1158,56 @@ function resolveQueryPlaceholders(queries) {
 }
 
 // ============================================================
+// GROUP CHAT TTL ROUTER
+// ============================================================
+
+async function handleIncomingMessage(chatId, text) {
+  // Private chats always respond immediately
+  if (!isGroupChat(chatId)) {
+    await processMessage(chatId, text);
+    return;
+  }
+
+  // Group chats: respond immediately if directly addressed or clear data intent
+  if (hasDirectIntent(text)) {
+    // Flush any accumulated context along with this message
+    const pending = pendingMessages.get(chatId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingMessages.delete(chatId);
+      const fullContext = pending.texts.length > 0
+        ? pending.texts.join('\n') + '\n' + text
+        : text;
+      await processMessage(chatId, fullContext);
+    } else {
+      await processMessage(chatId, text);
+    }
+    return;
+  }
+
+  // Accumulate and start/reset the TTL timer
+  if (!pendingMessages.has(chatId)) {
+    pendingMessages.set(chatId, { texts: [], timer: null });
+  }
+  const pending = pendingMessages.get(chatId);
+  pending.texts.push(text);
+
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(async () => {
+    const accumulated = pending.texts.join('\n');
+    pendingMessages.delete(chatId);
+    if (accumulated.trim()) {
+      logger.info('Group chat TTL fired — processing accumulated context', { chatId, lines: pending.texts.length });
+      await processMessage(chatId, accumulated).catch(err =>
+        logger.error('TTL-triggered processing failed', { error: err.message })
+      );
+    }
+  }, GROUP_CHAT_TTL_MS);
+
+  logger.info('Group chat message buffered', { chatId, buffered: pending.texts.length });
+}
+
+// ============================================================
 // WEBHOOK & ROUTES
 // ============================================================
 
@@ -1142,8 +1250,8 @@ app.post(`/telegram/${CONFIG.telegram.botToken}`, async (req, res) => {
       return;
     }
     
-    // Process message
-    await processMessage(chatId, text);
+    // Process message — route through group chat TTL buffer if needed
+    await handleIncomingMessage(chatId, text);
     
   } catch (error) {
     logger.error('Webhook error', { error: error.message, stack: error.stack });
