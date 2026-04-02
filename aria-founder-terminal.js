@@ -294,7 +294,50 @@ async function processMessage(chatId, messageText) {
     return;
   }
 
-  // Step 1b: Programmatic follow-up context merging
+  // Step 1b: Detect and break stale clarification loops
+  // If the agent is repeating a clarification question the user already moved on from, reset it
+  if (agentOutput.action_type === 'question' || agentOutput.intent === 'clarify') {
+    const lastContext = getLastContext(chatId);
+    if (lastContext && lastContext.action_type === 'question') {
+      // Previous turn was ALSO a clarification — check if user is stuck in a loop
+      const hasDataKeywords = /\b(leads?|clients?|artists?|staff|team|show|tell|find|how many|list|get|give|report)\b/i.test(messageText);
+      const isRejection = /^(no|nope|nevermind|never mind|forget it|cancel|stop|not that|nah)[\s!.?]*$/i.test(messageText.trim());
+
+      if (hasDataKeywords || isRejection) {
+        // User has moved on but model is stuck — override to a fresh interpretation
+        logger.warn('Breaking stale clarification loop', {
+          previousAction: lastContext.action_type,
+          currentMessage: messageText,
+          reason: hasDataKeywords ? 'user_has_data_keywords' : 'user_rejected',
+        });
+
+        if (isRejection) {
+          await sendTelegramMessage(chatId, "OK. What do you need?");
+          return;
+        }
+
+        // Force re-invocation without memory pollution
+        // Clear memory to break the loop, then re-invoke
+        const { clearMemory } = require('./lib/memory');
+        clearMemory(chatId);
+        logger.info('Cleared stale memory, re-invoking agent');
+
+        try {
+          agentOutput = await callAriaChain(chatId, messageText);
+          logger.info('Re-invocation after loop break', {
+            intent: agentOutput.intent,
+            action_type: agentOutput.action_type,
+          });
+        } catch (retryError) {
+          logger.error('Re-invocation failed', { error: retryError.message });
+          await sendTelegramMessage(chatId, "Let me try that again. What do you need?");
+          return;
+        }
+      }
+    }
+  }
+
+  // Step 1c: Programmatic follow-up context merging
   // If agent detected follow_up intent, merge previous filters with new ones
   if (agentOutput.intent === 'follow_up' && agentOutput.action_type === 'read') {
     const lastContext = getLastContext(chatId);
@@ -759,12 +802,28 @@ function chunkItemsForTelegram(header, itemStrings) {
 // Apply a single agent-extracted filter to items
 // P1-5 FIX: Use column-mapper IDs first, title matching as fallback
 function applyAgentFilter(items, filter, board) {
+  // Log the filter being applied
+  logger.info('Applying agent filter', {
+    field: filter.field,
+    operator: filter.operator,
+    value: filter.value,
+    board: board,
+  });
+
   return items.filter(item => {
     const columns = item.column_values || [];
 
     // Strategy 1: Use column-mapper to find exact column ID
     let targetCol = null;
     const mappedColId = getColumnId(board, filter.field);
+    
+    // Log column resolution result
+    logger.debug('Column resolution', {
+      field: filter.field,
+      mappedColId: mappedColId || 'not_found',
+      strategy: mappedColId ? 'column-mapper' : 'will_try_title_match',
+    });
+    
     if (mappedColId) {
       targetCol = columns.find(col => col.id === mappedColId);
     }
@@ -775,6 +834,20 @@ function applyAgentFilter(items, filter, board) {
         const title = getColumnTitle(col.id).toLowerCase();
         return title.includes(filter.field.toLowerCase());
       });
+      
+      // Log fallback result
+      if (targetCol) {
+        logger.debug('Column resolved via title match', {
+          field: filter.field,
+          columnId: targetCol.id,
+          columnTitle: getColumnTitle(targetCol.id),
+        });
+      } else {
+        logger.warn('Column not found', {
+          field: filter.field,
+          availableColumns: columns.map(c => ({ id: c.id, title: getColumnTitle(c.id) })),
+        });
+      }
     }
 
     if (!targetCol || !targetCol.text) return false;
@@ -794,15 +867,36 @@ function applyAgentFilter(items, filter, board) {
       case 'less_than':
       case 'less_equal': {
         const numMatch = targetCol.text.match(/[\d,]+\.?\d*/);
+        
+        // Log numeric extraction result
+        logger.debug('Numeric extraction', {
+          field: filter.field,
+          columnText: targetCol.text,
+          regexMatch: numMatch ? numMatch[0] : 'no_match',
+          operator: filter.operator,
+        });
+        
         if (!numMatch) return false;
         const itemValue = parseFloat(numMatch[0].replace(/,/g, ''));
         const targetValue = parseFloat(filter.value.replace(/,/g, ''));
         if (isNaN(itemValue) || isNaN(targetValue)) return false;
-        if (filter.operator === 'greater_than') return itemValue > targetValue;
-        if (filter.operator === 'greater_equal') return itemValue >= targetValue;
-        if (filter.operator === 'less_than') return itemValue < targetValue;
-        if (filter.operator === 'less_equal') return itemValue <= targetValue;
-        return false;
+        
+        let comparisonResult = false;
+        if (filter.operator === 'greater_than') comparisonResult = itemValue > targetValue;
+        if (filter.operator === 'greater_equal') comparisonResult = itemValue >= targetValue;
+        if (filter.operator === 'less_than') comparisonResult = itemValue < targetValue;
+        if (filter.operator === 'less_equal') comparisonResult = itemValue <= targetValue;
+        
+        // Log comparison result
+        logger.debug('Numeric comparison', {
+          field: filter.field,
+          itemValue: itemValue,
+          targetValue: targetValue,
+          operator: filter.operator,
+          result: comparisonResult ? 'include' : 'exclude',
+        });
+        
+        return comparisonResult;
       }
       case 'not_equals':
         return colValue !== filterValue && !colValue.includes(filterValue);
