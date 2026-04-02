@@ -371,8 +371,9 @@ async function processMessage(chatId, messageText) {
 
   // Step 2: Handle based on action type
 
-  // CHAT / GREETING / QUESTION - No data needed
-  if (agentOutput.action_type === 'chat' || agentOutput.action_type === 'question') {
+  // CHAT / GREETING / QUESTION / NONE - No data needed
+  // v6 uses action_type 'none' for greetings/clarifications; keep 'chat'/'question' for backward compat
+  if (agentOutput.action_type === 'none' || agentOutput.action_type === 'chat' || agentOutput.action_type === 'question') {
     await sendTelegramMessage(chatId, agentOutput.message);
     logAudit({
       type: agentOutput.action_type,
@@ -1220,41 +1221,44 @@ async function registerWebhook() {
 
 const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, async () => {
-  logger.info('═══════════════════════════════════════════════');
-  logger.info('  ARIA V4.1 - REASONING DISCIPLINE');
-  logger.info('  Denicx Entertainment CRM');
-  logger.info(`  Port: ${PORT}`);
-  logger.info('═══════════════════════════════════════════════');
-  await fetchBoardColumns();
+// Only start server if not in test mode
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, async () => {
+    logger.info('═══════════════════════════════════════════════');
+    logger.info('  ARIA V4.1 - REASONING DISCIPLINE');
+    logger.info('  Denicx Entertainment CRM');
+    logger.info(`  Port: ${PORT}`);
+    logger.info('═══════════════════════════════════════════════');
+    await fetchBoardColumns();
 
-  // Initialize LangChain chain after board columns are loaded
-  try {
-    await initChain({
-      gemini: {
-        apiKey: CONFIG.gemini.apiKey,
-        model: CONFIG.gemini.model,
-      },
-      boardIds: {
-        sales: CONFIG.monday.boards.sales.id,
-        artists: CONFIG.monday.boards.artists.id,
-        staff: CONFIG.monday.boards.staff.id,
-      },
-      salesColumns: boardColumns.sales,
-      artistsColumns: boardColumns.artists,
-      staffColumns: boardColumns.staff,
-      boardGroups: boardGroups,
-    });
-    logger.info('LangChain ARIA chain initialized successfully');
-  } catch (err) {
-    logger.error('Failed to initialize LangChain chain', { error: err.message, stack: err.stack });
-    logger.warn('System cannot start without LangChain - exiting');
-    process.exit(1);
-  }
+    // Initialize LangChain chain after board columns are loaded
+    try {
+      await initChain({
+        gemini: {
+          apiKey: CONFIG.gemini.apiKey,
+          model: CONFIG.gemini.model,
+        },
+        boardIds: {
+          sales: CONFIG.monday.boards.sales.id,
+          artists: CONFIG.monday.boards.artists.id,
+          staff: CONFIG.monday.boards.staff.id,
+        },
+        salesColumns: boardColumns.sales,
+        artistsColumns: boardColumns.artists,
+        staffColumns: boardColumns.staff,
+        boardGroups: boardGroups,
+      });
+      logger.info('LangChain ARIA chain initialized successfully');
+    } catch (err) {
+      logger.error('Failed to initialize LangChain chain', { error: err.message, stack: err.stack });
+      logger.warn('System cannot start without LangChain - exiting');
+      process.exit(1);
+    }
 
-  await registerWebhook();
-  logger.info('Ready for production. 🚀');
-});
+    await registerWebhook();
+    logger.info('Ready for production. 🚀');
+  });
+}
 
 // Error handling
 process.on('unhandledRejection', (reason) => {
